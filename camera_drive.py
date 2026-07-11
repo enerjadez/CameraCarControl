@@ -37,9 +37,17 @@ from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QFont, QGuiApplication, QImage, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
+from camera_imaging import (
+    CameraControlReport,
+    LightMetrics,
+    LowLightEnhancer,
+    apply_camera_controls,
+    compute_light_metrics,
+)
+
 
 APP_NAME = "CameraDrive AI"
-APP_VERSION = "0.5.0"
+APP_VERSION = "0.6.0"
 
 MODEL_URLS = {
     "lite": (
@@ -97,7 +105,7 @@ POSE_CONNECTIONS: tuple[tuple[int, int], ...] = (
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "config_version": 5,
+    "config_version": 6,
     # Feet-only is the default accessibility mode. The virtual left stick stays
     # centred so steering can come from a keyboard, wheel, or physical gamepad.
     "control_mode": "pedals_only",
@@ -109,6 +117,22 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "capture_fps": 120,
     "camera_use_mjpg": True,
     "camera_backend": "dshow",
+    # Camera controls are best-effort because property ranges depend on the
+    # webcam and backend. DirectShow auto_lock lets exposure settle, then locks
+    # it so frame-to-frame brightness changes do not confuse optical flow.
+    "camera_exposure_mode": "auto_lock",
+    "camera_manual_exposure": -7.0,
+    "camera_gain": None,
+    "camera_brightness": None,
+    "camera_autofocus": None,
+    "camera_focus": None,
+    "camera_warmup_seconds": 1.0,
+    # A single deterministic transform is shared by MediaPipe and optical flow.
+    # Gamma below 1 brightens shadows; CLAHE raises local lower-leg contrast.
+    "low_light_enhancement_enabled": True,
+    "low_light_gamma": 0.72,
+    "low_light_clahe_clip_limit": 1.6,
+    "low_light_clahe_grid_size": 8,
     # Optical flow runs at tracking_width on every available camera frame. The
     # Full pose model runs independently at inference_width and only re-anchors
     # the semantic knee/ankle/heel/toe identities.
@@ -134,7 +158,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # swaps two similar-looking feet.
     "foot_identity_lock": True,
     "foot_identity_swap_margin_pixels": 22.0,
-    # The v0.5 leg lock tracks each complete hip-to-toe chain.  MediaPipe's
+    # The coherent leg lock tracks each complete hip-to-toe chain. MediaPipe's
     # person mask is used only as a soft foreground cue, so a weak mask cannot
     # make a valid foot disappear.
     "enable_segmentation_mask": True,
@@ -164,7 +188,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "optical_flow_max_fb_error_pixels": 1.45,
     "optical_flow_anchor_max_distance_pixels": 48.0,
     "optical_flow_patch_radius_pixels": 4.0,
-    "optical_flow_min_patch_votes": 3,
+    "optical_flow_patch_grid_size": 3,
+    "optical_flow_min_patch_votes": 4,
     "optical_flow_window_pixels": 15,
     "optical_flow_max_level": 1,
     "optical_flow_validation_interval": 6,
@@ -179,26 +204,35 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "feature_filter_min_cutoff_hz": 24.0,
     "feature_filter_beta": 3.0,
     "feature_filter_derivative_cutoff_hz": 4.0,
-    "pedal_raw_feature_blend": 0.97,
+    "pedal_raw_feature_blend": 0.90,
     # Legacy common values remain for compatibility with third-party configs.
-    "pedal_sensitivity": 2.20,
+    "pedal_sensitivity": 1.0,
     "pedal_deadzone": 0.004,
-    "pedal_curve_exponent": 0.44,
-    # A few percent of the calibrated movement produces substantial throttle.
-    # Brake is intentionally less aggressive to reduce accidental braking.
-    "throttle_sensitivity": 3.40,
-    "brake_sensitivity": 2.25,
-    "throttle_deadzone": 0.0015,
+    "pedal_curve_exponent": 1.0,
+    # Calibration defines the smallest comfortable action as full travel. The
+    # endpoint-safe boost makes initial response visible without collapsing the
+    # useful trigger range into the first few percent of foot movement.
+    "throttle_sensitivity": 1.0,
+    "brake_sensitivity": 1.0,
+    "throttle_deadzone": 0.004,
     "brake_deadzone": 0.005,
-    "throttle_curve_exponent": 0.27,
-    "brake_curve_exponent": 0.44,
-    "throttle_initial_response": 0.05,
+    "throttle_curve_exponent": 1.0,
+    "brake_curve_exponent": 1.0,
+    "throttle_response_boost": 0.55,
+    "brake_response_boost": 0.35,
+    "throttle_initial_response": 0.0,
     "brake_initial_response": 0.0,
+    # Accept a press that follows the calibrated articulation at a different
+    # comfortable foot angle, while rejecting unrelated sideways motion.
+    "pedal_min_feature_coverage": 0.35,
+    "pedal_direction_tolerance_degrees": 55.0,
+    "pedal_magnitude_blend": 0.25,
+    "foot_core_min_confidence": 0.24,
     # A small, bounded rising-edge prediction offsets one camera frame of delay;
     # release is never predicted and still snaps to zero.
     "pedal_lookahead_seconds": 0.012,
     "pedal_prediction_min_delta": 0.0008,
-    "pedal_prediction_max_advance": 0.10,
+    "pedal_prediction_max_advance": 0.035,
     "pedal_noise_floor": 0.0010,
     "pedal_noise_multiplier": 1.20,
     "pedal_noise_deadzone_factor": 0.020,
@@ -243,7 +277,7 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
         "preview_max_fps": 15,
         "auto_hide_preview_when_active": True,
         "optical_flow_patch_radius_pixels": 4.0,
-        "optical_flow_min_patch_votes": 3,
+        "optical_flow_min_patch_votes": 4,
         "optical_flow_window_pixels": 15,
         "optical_flow_max_level": 1,
         "optical_flow_validation_interval": 6,
@@ -262,7 +296,7 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
         "preview_max_fps": 12,
         "auto_hide_preview_when_active": True,
         "optical_flow_patch_radius_pixels": 3.5,
-        "optical_flow_min_patch_votes": 3,
+        "optical_flow_min_patch_votes": 4,
         "optical_flow_window_pixels": 13,
         "optical_flow_max_level": 1,
         "optical_flow_validation_interval": 6,
@@ -282,7 +316,7 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
         "preview_max_fps": 10,
         "auto_hide_preview_when_active": True,
         "optical_flow_patch_radius_pixels": 3.0,
-        "optical_flow_min_patch_votes": 3,
+        "optical_flow_min_patch_votes": 4,
         "optical_flow_window_pixels": 11,
         "optical_flow_max_level": 0,
         "optical_flow_validation_interval": 8,
@@ -302,7 +336,7 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
         "preview_max_fps": 12,
         "auto_hide_preview_when_active": True,
         "optical_flow_patch_radius_pixels": 4.0,
-        "optical_flow_min_patch_votes": 3,
+        "optical_flow_min_patch_votes": 4,
         "optical_flow_window_pixels": 15,
         "optical_flow_max_level": 1,
         "optical_flow_validation_interval": 5,
@@ -325,7 +359,7 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
         "preview_max_fps": 12,
         "auto_hide_preview_when_active": True,
         "optical_flow_patch_radius_pixels": 4.0,
-        "optical_flow_min_patch_votes": 3,
+        "optical_flow_min_patch_votes": 4,
         "optical_flow_window_pixels": 17,
         "optical_flow_max_level": 2,
         "optical_flow_validation_interval": 4,
@@ -343,9 +377,25 @@ PERFORMANCE_PROFILES: dict[str, dict[str, Any]] = {
 }
 
 @dataclass
+class FootFeatureObservation:
+    """Foot geometry plus per-dimension validity in a shin-local frame."""
+
+    values: np.ndarray
+    validity: np.ndarray
+    confidence: float
+
+    def copy(self) -> "FootFeatureObservation":
+        return FootFeatureObservation(
+            values=self.values.copy(),
+            validity=self.validity.copy(),
+            confidence=float(self.confidence),
+        )
+
+
+@dataclass
 class PoseFeatures:
-    left_foot: Optional[np.ndarray] = None
-    right_foot: Optional[np.ndarray] = None
+    left_foot: Optional[FootFeatureObservation] = None
+    right_foot: Optional[FootFeatureObservation] = None
     steering_angle: Optional[float] = None
     left_foot_ok: bool = False
     right_foot_ok: bool = False
@@ -381,10 +431,12 @@ class CalibrationData:
     left_foot_neutral: np.ndarray
     left_foot_pressed: np.ndarray
     left_foot_noise: np.ndarray
+    left_foot_reliability: np.ndarray
     left_foot_signal_to_noise: float
     right_foot_neutral: np.ndarray
     right_foot_pressed: np.ndarray
     right_foot_noise: np.ndarray
+    right_foot_reliability: np.ndarray
     right_foot_signal_to_noise: float
     steering_neutral: float
     steering_left: float
@@ -420,6 +472,8 @@ class UiSnapshot:
     fps: float = 0.0
     camera_fps: float = 0.0
     ai_fps: float = 0.0
+    light_luma: float = 0.0
+    light_dark_fraction: float = 0.0
     camera_mode: str = "Camera is starting"
     preview: Optional[QImage] = None
     show_preview: bool = True
@@ -449,6 +503,7 @@ class FramePacket:
     sequence: int
     captured_at: float
     frame: np.ndarray
+    alignment_gray: Optional[np.ndarray] = None
 
 
 @dataclass(frozen=True)
@@ -706,6 +761,7 @@ class CameraCaptureThread(threading.Thread):
         self.actual_height = 0
         self.reported_fps = 0.0
         self.measured_fps = 0.0
+        self.control_report: Optional[CameraControlReport] = None
         self._fps_smoother = ExponentialSmoother(0.45)
         self.last_frame_at = 0.0
 
@@ -716,11 +772,17 @@ class CameraCaptureThread(threading.Thread):
         requested = int(self.config["capture_fps"])
         reported = self.reported_fps
         if reported > 0.0:
-            return (
+            description = (
                 f"{width}x{height} • camera reports {reported:0.0f} FPS "
                 f"• requested {requested}"
             )
-        return f"{width}x{height} • requested {requested} FPS"
+        else:
+            description = f"{width}x{height} • requested {requested} FPS"
+        if self.control_report is not None:
+            description += f" • {self.control_report.backend}"
+            if self.control_report.exposure is not None:
+                description += f" • EXP {self.control_report.exposure:g}"
+        return description
 
     def run(self) -> None:
         capture: Optional[cv2.VideoCapture] = None
@@ -728,6 +790,13 @@ class CameraCaptureThread(threading.Thread):
             set_current_thread_priority("above_normal")
         try:
             capture = open_camera(self.config)
+            self.control_report = apply_camera_controls(
+                capture,
+                self.config,
+                stop_event=self.stop_event,
+            )
+            for message in self.control_report.messages:
+                print(f"[Camera] {message}", flush=True)
             self.actual_width = int(round(capture.get(cv2.CAP_PROP_FRAME_WIDTH) or 0.0))
             self.actual_height = int(round(capture.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0.0))
             self.reported_fps = float(capture.get(cv2.CAP_PROP_FPS) or 0.0)
@@ -814,7 +883,11 @@ class PoseInferenceThread(threading.Thread):
                 last_timestamp_ms = timestamp_ms
 
                 processing_started = time.monotonic()
-                gray = cv2.cvtColor(packet.frame, cv2.COLOR_BGR2GRAY)
+                gray = (
+                    packet.alignment_gray
+                    if packet.alignment_gray is not None
+                    else cv2.cvtColor(packet.frame, cv2.COLOR_BGR2GRAY)
+                )
                 inference_frame = resize_to_width(
                     packet.frame,
                     int(self.config["inference_width"]),
@@ -1181,14 +1254,26 @@ class CalibrationManager:
 
     def _reduce_samples(self, phase: str, samples: Sequence[Any]) -> Any:
         if phase == "neutral":
-            left, left_noise = robust_center_and_noise([sample[0] for sample in samples])
-            right, right_noise = robust_center_and_noise([sample[1] for sample in samples])
+            left, left_noise, left_reliability = robust_observation_stats(
+                [sample[0] for sample in samples]
+            )
+            right, right_noise, right_reliability = robust_observation_stats(
+                [sample[1] for sample in samples]
+            )
             steer = 0.0 if self.pedals_only else circular_mean(
                 [sample[2] for sample in samples]
             )
-            return left, left_noise, right, right_noise, steer
+            return (
+                left,
+                left_noise,
+                left_reliability,
+                right,
+                right_noise,
+                right_reliability,
+                steer,
+            )
         if phase in {"gas", "brake"}:
-            return robust_center_and_noise(samples)
+            return robust_observation_stats(samples)
         if phase in {"left", "right"}:
             return circular_mean(samples)
         raise ValueError(f"Unknown calibration phase: {phase}")
@@ -1197,23 +1282,43 @@ class CalibrationManager:
         (
             neutral_left,
             neutral_left_noise,
+            neutral_left_reliability,
             neutral_right,
             neutral_right_noise,
+            neutral_right_reliability,
             neutral_steer,
         ) = self.captured["neutral"]
-        gas_right, gas_right_noise = self.captured["gas"]
-        brake_left, brake_left_noise = self.captured["brake"]
+        gas_right, gas_right_noise, gas_right_reliability = self.captured["gas"]
+        brake_left, brake_left_noise, brake_left_reliability = self.captured["brake"]
 
         left_noise = np.maximum(neutral_left_noise, brake_left_noise)
         right_noise = np.maximum(neutral_right_noise, gas_right_noise)
+        left_reliability = np.minimum(
+            neutral_left_reliability, brake_left_reliability
+        )
+        right_reliability = np.minimum(
+            neutral_right_reliability, gas_right_reliability
+        )
         noise_floor = float(self.config["pedal_noise_floor"])
-        left_motion = float(np.linalg.norm(brake_left - neutral_left))
-        right_motion = float(np.linalg.norm(gas_right - neutral_right))
+        left_motion = float(
+            np.sqrt(np.sum(left_reliability * np.square(brake_left - neutral_left)))
+        )
+        right_motion = float(
+            np.sqrt(np.sum(right_reliability * np.square(gas_right - neutral_right)))
+        )
         left_snr = feature_signal_to_noise(
-            neutral_left, brake_left, left_noise, noise_floor
+            neutral_left,
+            brake_left,
+            left_noise,
+            noise_floor,
+            weights=left_reliability,
         )
         right_snr = feature_signal_to_noise(
-            neutral_right, gas_right, right_noise, noise_floor
+            neutral_right,
+            gas_right,
+            right_noise,
+            noise_floor,
+            weights=right_reliability,
         )
         minimum_motion = max(1e-5, float(self.config["calibration_min_absolute_motion"]))
         minimum_snr = max(1.0, float(self.config["calibration_min_signal_to_noise"]))
@@ -1254,10 +1359,12 @@ class CalibrationManager:
             left_foot_neutral=neutral_left,
             left_foot_pressed=brake_left,
             left_foot_noise=left_noise,
+            left_foot_reliability=left_reliability,
             left_foot_signal_to_noise=left_snr,
             right_foot_neutral=neutral_right,
             right_foot_pressed=gas_right,
             right_foot_noise=right_noise,
+            right_foot_reliability=right_reliability,
             right_foot_signal_to_noise=right_snr,
             steering_neutral=float(neutral_steer),
             steering_left=float(steer_left),
@@ -1278,16 +1385,22 @@ class ControlMapper:
     def reset(self) -> None:
         self._last_projection = {"gas": None, "brake": None}
 
-    def _project_foot(self, side: str, feature: np.ndarray) -> tuple[float, float]:
+    def _project_foot(
+        self,
+        side: str,
+        feature: FootFeatureObservation,
+    ) -> Optional[tuple[float, float]]:
         if side == "left":
             neutral = self.calibration.left_foot_neutral
             pressed = self.calibration.left_foot_pressed
             noise = self.calibration.left_foot_noise
+            reliability = self.calibration.left_foot_reliability
             snr = self.calibration.left_foot_signal_to_noise
         elif side == "right":
             neutral = self.calibration.right_foot_neutral
             pressed = self.calibration.right_foot_pressed
             noise = self.calibration.right_foot_noise
+            reliability = self.calibration.right_foot_reliability
             snr = self.calibration.right_foot_signal_to_noise
         else:
             raise ValueError("side must be 'left' or 'right'")
@@ -1296,9 +1409,17 @@ class ControlMapper:
             neutral,
             pressed,
             noise=noise,
+            calibration_weights=reliability,
             noise_floor=float(self.config["pedal_noise_floor"]),
             noise_multiplier=float(self.config["pedal_noise_multiplier"]),
+            minimum_coverage=float(self.config["pedal_min_feature_coverage"]),
+            direction_tolerance_degrees=float(
+                self.config["pedal_direction_tolerance_degrees"]
+            ),
+            magnitude_blend=float(self.config["pedal_magnitude_blend"]),
         )
+        if value is None:
+            return None
         return value, float(snr)
 
     def _predict_rising_projection(
@@ -1332,8 +1453,8 @@ class ControlMapper:
 
     def map_pedal_features(
         self,
-        left_foot: Optional[np.ndarray],
-        right_foot: Optional[np.ndarray],
+        left_foot: Optional[FootFeatureObservation],
+        right_foot: Optional[FootFeatureObservation],
         dt: Optional[float] = None,
     ) -> tuple[Optional[float], Optional[float]]:
         left_projection = (
@@ -1376,6 +1497,7 @@ class ControlMapper:
                     )
                 ),
                 response_floor=float(self.config.get("throttle_initial_response", 0.0)),
+                response_boost=float(self.config.get("throttle_response_boost", 0.0)),
             )
         else:
             self._last_projection["gas"] = None
@@ -1405,6 +1527,7 @@ class ControlMapper:
                     )
                 ),
                 response_floor=float(self.config.get("brake_initial_response", 0.0)),
+                response_boost=float(self.config.get("brake_response_boost", 0.0)),
             )
         else:
             self._last_projection["brake"] = None
@@ -1426,13 +1549,17 @@ class ControlMapper:
             features.right_foot,
             dt=dt,
         )
-        assert gas is not None and brake is not None
+        # Optional heel/world dimensions can drop out after calibration even
+        # while the core landmarks remain present. A failed coverage gate must
+        # neutralize only that input, never crash the control thread.
+        gas_value = 0.0 if gas is None else gas
+        brake_value = 0.0 if brake is None else brake
         steering = (
             0.0
             if self.pedals_only
             else self._map_steering(float(features.steering_angle))
         )
-        return steering, gas, brake
+        return steering, gas_value, brake_value
 
     def _map_steering(self, angle: float) -> float:
         neutral = self.calibration.steering_neutral
@@ -1475,6 +1602,8 @@ class CameraDriveWorker(threading.Thread):
         self.controller: Optional[VirtualXboxController] = None
         self.calibration = CalibrationManager(config)
         self.mapper: Optional[ControlMapper] = None
+        self.low_light_enhancer = LowLightEnhancer(config)
+        self.light_metrics: Optional[LightMetrics] = None
         self.pose_tracker = PoseFeatureTracker(config)
         steering_tau = float(
             config.get("steering_smoothing_tau_seconds", config["smoothing_tau_seconds"])
@@ -1575,6 +1704,7 @@ class CameraDriveWorker(threading.Thread):
             previous_capture_time: Optional[float] = None
             last_frame_received_at = time.monotonic()
             last_preview_at = 0.0
+            last_light_metrics_at = 0.0
             preview_interval = 1.0 / max(
                 1.0, float(self.config.get("preview_max_fps", 15.0))
             )
@@ -1616,17 +1746,25 @@ class CameraDriveWorker(threading.Thread):
                     packet.frame,
                     int(self.config["camera_rotation_degrees"]),
                 )
-                tracking_frame = resize_to_width(
+                if now - last_light_metrics_at >= 0.50:
+                    self.light_metrics = compute_light_metrics(frame)
+                    last_light_metrics_at = now
+                enhanced_frame, tracking_frame = prepare_processing_frames(
                     frame,
-                    int(self.config.get("tracking_width", self.config["inference_width"])),
+                    self.config,
+                    self.low_light_enhancer,
                 )
+                alignment_gray = cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2GRAY)
                 # This one-slot queue drops any unprocessed image, so AI always
-                # works on the newest available frame instead of adding latency.
+                # works on the newest full capture instead of adding latency.
+                # The attached gray image matches the high-rate tracking size,
+                # so delayed semantic anchors can be aligned without upscaling.
                 inference_frames.publish(
                     FramePacket(
                         sequence=packet.sequence,
                         captured_at=packet.captured_at,
-                        frame=tracking_frame,
+                        frame=enhanced_frame,
+                        alignment_gray=alignment_gray,
                     )
                 )
 
@@ -1660,8 +1798,13 @@ class CameraDriveWorker(threading.Thread):
                         f"{self.config.get('_runtime_profile', 'custom/balanced')} profile"
                     ),
                 }
+                if self.light_metrics is not None:
+                    changes["light_luma"] = self.light_metrics.median_luma
+                    changes["light_dark_fraction"] = self.light_metrics.dark_fraction
                 if self._preview_enabled and now - last_preview_at >= preview_interval:
-                    changes["preview"] = make_preview_qimage(frame, features, self.config)
+                    changes["preview"] = make_preview_qimage(
+                        enhanced_frame, features, self.config
+                    )
                     last_preview_at = now
                 self.shared.update(**changes)
 
@@ -1947,7 +2090,7 @@ class CameraDriveWorker(threading.Thread):
         features: PoseFeatures,
         side: str,
         now: float,
-    ) -> tuple[Optional[np.ndarray], bool]:
+    ) -> tuple[Optional[FootFeatureObservation], bool]:
         timeout = float(self.config["lost_tracking_timeout_seconds"])
         if side == "left":
             value = features.left_foot
@@ -2255,7 +2398,9 @@ class OverlayWindow(QWidget):
             (
                 f"TRACK {snapshot.fps:0.0f} • "
                 f"AI {snapshot.ai_fps:0.0f} • "
-                f"CAM {snapshot.camera_fps:0.0f} FPS"
+                f"CAM {snapshot.camera_fps:0.0f} • "
+                f"LIGHT {snapshot.light_luma:0.0f} • "
+                f"DARK {snapshot.light_dark_fraction * 100.0:0.0f}%"
             ),
         )
 
@@ -2736,6 +2881,42 @@ def robust_center_and_noise(
     return centre, noise
 
 
+def robust_observation_stats(
+    observations: Sequence[FootFeatureObservation],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Masked median, robust noise, and reliability for foot observations."""
+
+    if not observations:
+        raise ValueError("Cannot analyse an empty observation list")
+    values = np.stack(
+        [np.asarray(item.values, dtype=np.float64) for item in observations], axis=0
+    )
+    validity = np.stack(
+        [np.asarray(item.validity, dtype=np.float64) for item in observations], axis=0
+    )
+    if values.shape != validity.shape or not np.all(np.isfinite(values)):
+        raise ValueError("Foot observations contained invalid values")
+    dimension_count = values.shape[1]
+    centre = np.zeros(dimension_count, dtype=np.float64)
+    noise = np.full(dimension_count, 1e6, dtype=np.float64)
+    reliability = np.zeros(dimension_count, dtype=np.float64)
+    required_samples = max(3, int(math.ceil(len(observations) * 0.45)))
+    for index in range(dimension_count):
+        valid = np.isfinite(validity[:, index]) & (validity[:, index] >= 0.05)
+        count = int(valid.sum())
+        if count < required_samples:
+            continue
+        selected = values[valid, index]
+        median = float(np.median(selected))
+        centre[index] = median
+        noise[index] = float(np.median(np.abs(selected - median)) * 1.4826)
+        coverage = count / max(1.0, float(len(observations)))
+        reliability[index] = clip(
+            coverage * float(np.median(validity[valid, index])), 0.0, 1.0
+        )
+    return centre, noise, reliability
+
+
 def unit_vector(vector: np.ndarray) -> Optional[np.ndarray]:
     vector = np.asarray(vector, dtype=np.float64)
     norm = float(np.linalg.norm(vector))
@@ -2749,29 +2930,41 @@ def feature_signal_to_noise(
     pressed: np.ndarray,
     noise: np.ndarray,
     noise_floor: float,
+    weights: Optional[np.ndarray] = None,
 ) -> float:
     axis = np.asarray(pressed, dtype=np.float64) - np.asarray(neutral, dtype=np.float64)
     scale = np.maximum(np.abs(np.asarray(noise, dtype=np.float64)), max(1e-6, float(noise_floor)))
-    return float(np.linalg.norm(axis / scale))
+    normalized = axis / scale
+    if weights is None:
+        return float(np.linalg.norm(normalized))
+    weight_array = np.clip(np.asarray(weights, dtype=np.float64), 0.0, 1.0)
+    return float(np.sqrt(np.sum(weight_array * np.square(normalized))))
 
 
 def project_pedal(
-    current: np.ndarray,
+    current: FootFeatureObservation,
     neutral: np.ndarray,
     pressed: np.ndarray,
     noise: Optional[np.ndarray] = None,
+    calibration_weights: Optional[np.ndarray] = None,
     noise_floor: float = 0.003,
     noise_multiplier: float = 1.0,
-) -> float:
-    """Project a foot feature onto its calibrated axis with noise whitening.
+    minimum_coverage: float = 0.35,
+    direction_tolerance_degrees: float = 55.0,
+    magnitude_blend: float = 0.25,
+) -> Optional[float]:
+    """Project valid shin-local foot geometry onto its calibrated action.
 
-    Dimensions that jittered during calibration receive less influence. This is
-    what permits a genuinely small but stable movement to control a full trigger
-    without letting a noisy depth estimate dominate the pedal.
+    Missing dimensions are excluded instead of becoming numeric zeros. A small
+    magnitude contribution accepts a comfortable press that bends along a nearby
+    direction, while the direction gate rejects unrelated sideways motion.
     """
-    current = np.asarray(current, dtype=np.float64)
+    values = np.asarray(current.values, dtype=np.float64)
+    validity = np.clip(np.asarray(current.validity, dtype=np.float64), 0.0, 1.0)
     neutral = np.asarray(neutral, dtype=np.float64)
     pressed = np.asarray(pressed, dtype=np.float64)
+    if values.shape != neutral.shape or validity.shape != neutral.shape:
+        return None
     axis = pressed - neutral
     if noise is None:
         scale = np.ones_like(axis)
@@ -2781,11 +2974,51 @@ def project_pedal(
             max(1e-6, float(noise_floor)),
         )
     scaled_axis = axis / scale
-    denominator = float(np.dot(scaled_axis, scaled_axis))
-    if denominator < 1e-8:
-        return 0.0
-    scaled_delta = (current - neutral) / scale
-    value = float(np.dot(scaled_delta, scaled_axis) / denominator)
+    if calibration_weights is None:
+        reference_weights = np.ones_like(scaled_axis)
+    else:
+        reference_weights = np.clip(
+            np.asarray(calibration_weights, dtype=np.float64), 0.0, 1.0
+        )
+    if reference_weights.shape != scaled_axis.shape:
+        return None
+    active_weights = reference_weights * validity
+    reference_energy = float(np.sum(reference_weights * np.square(scaled_axis)))
+    available_energy = float(np.sum(active_weights * np.square(scaled_axis)))
+    if reference_energy < 1e-8:
+        return None
+    coverage = available_energy / reference_energy
+    if coverage < clip(minimum_coverage, 0.05, 1.0) or available_energy < 1e-8:
+        return None
+
+    scaled_delta = (values - neutral) / scale
+    numerator = float(np.sum(active_weights * scaled_delta * scaled_axis))
+    parallel = numerator / available_energy
+    delta_energy = float(np.sum(active_weights * np.square(scaled_delta)))
+    direction_gate = 0.0
+    magnitude = 0.0
+    if delta_energy > 1e-10 and numerator > 0.0:
+        cosine = clip(
+            numerator / math.sqrt(max(1e-12, delta_energy * available_energy)),
+            -1.0,
+            1.0,
+        )
+        tolerance = math.cos(
+            math.radians(clip(direction_tolerance_degrees, 0.0, 89.0))
+        )
+        normalized_direction = clip(
+            (cosine - tolerance) / max(1e-6, 1.0 - tolerance),
+            0.0,
+            1.0,
+        )
+        # Keep near-calibrated articulation almost linear, while still taking
+        # unrelated motion completely to zero outside the angular tolerance.
+        direction_gate = normalized_direction ** 0.25
+        magnitude = math.sqrt(delta_energy / available_energy)
+    blend = clip(magnitude_blend, 0.0, 1.0)
+    value = direction_gate * (
+        (1.0 - blend) * max(0.0, parallel) + blend * magnitude
+    )
     return clip(value, 0.0, 1.35)
 
 
@@ -2801,6 +3034,7 @@ def shape_unipolar(
     deadzone: float,
     exponent: float,
     response_floor: float = 0.0,
+    response_boost: float = 0.0,
 ) -> float:
     value = clip(value, 0.0, 1.0)
     deadzone = clip(deadzone, 0.0, 0.95)
@@ -2808,6 +3042,8 @@ def shape_unipolar(
         return 0.0
     remapped = (value - deadzone) / (1.0 - deadzone)
     shaped = clip(remapped ** max(0.1, exponent), 0.0, 1.0)
+    boost = clip(response_boost, 0.0, 2.0)
+    shaped = clip(shaped + boost * shaped * (1.0 - shaped), 0.0, 1.0)
     floor = clip(response_floor, 0.0, 0.50)
     return clip(floor + (1.0 - floor) * shaped, 0.0, 1.0)
 
@@ -3036,7 +3272,12 @@ class PoseFeatureTracker:
             2.0, float(config["optical_flow_anchor_max_distance_pixels"])
         )
         self.patch_radius = max(1.0, float(config["optical_flow_patch_radius_pixels"]))
-        self.min_patch_votes = max(1, int(config["optical_flow_min_patch_votes"]))
+        patch_grid = max(1, int(config.get("optical_flow_patch_grid_size", 3)))
+        self.patch_grid_size = patch_grid if patch_grid % 2 == 1 else patch_grid + 1
+        self.min_patch_votes = min(
+            self.patch_grid_size * self.patch_grid_size,
+            max(1, int(config["optical_flow_min_patch_votes"])),
+        )
         window = max(9, int(config["optical_flow_window_pixels"]))
         self.flow_window = window if window % 2 == 1 else window + 1
         self.flow_max_level = max(0, int(config["optical_flow_max_level"]))
@@ -3056,7 +3297,9 @@ class PoseFeatureTracker:
 
         self.prev_gray: Optional[np.ndarray] = None
         self.points: dict[int, np.ndarray] = {}
+        self.point_quality: dict[int, float] = {}
         self.last_ai_anchor: dict[int, float] = {}
+        self.last_ai_quality: dict[int, float] = {}
         self.world_points: dict[int, np.ndarray] = {}
         self.last_world_anchor: dict[int, float] = {}
         self.last_landmarks: tuple[tuple[float, float, float], ...] = ()
@@ -3067,8 +3310,8 @@ class PoseFeatureTracker:
         self.person_mask: Optional[np.ndarray] = None
         self.person_mask_updated_at = 0.0
         self.last_leg_affine_quality: dict[str, float] = {"left": 0.0, "right": 0.0}
-        self.last_left_feature: Optional[np.ndarray] = None
-        self.last_right_feature: Optional[np.ndarray] = None
+        self.last_left_feature: Optional[FootFeatureObservation] = None
+        self.last_right_feature: Optional[FootFeatureObservation] = None
         self.last_steering: Optional[float] = None
         self.last_left_time = 0.0
         self.last_right_time = 0.0
@@ -3077,7 +3320,9 @@ class PoseFeatureTracker:
     def reset(self) -> None:
         self.prev_gray = None
         self.points.clear()
+        self.point_quality.clear()
         self.last_ai_anchor.clear()
+        self.last_ai_quality.clear()
         self.world_points.clear()
         self.last_world_anchor.clear()
         self.last_landmarks = ()
@@ -3136,7 +3381,7 @@ class PoseFeatureTracker:
                     )
 
         features.landmarks = list(self.last_landmarks)
-        merged, sources = self._merge_points(
+        merged, sources, point_quality = self._merge_points(
             ai_points=ai_points,
             ai_confidences=ai_confidences,
             flow_points=flow_points,
@@ -3144,6 +3389,7 @@ class PoseFeatureTracker:
             now=float(now),
         )
         self.points = merged
+        self.point_quality = point_quality
         features.tracked_landmarks = {
             index: (float(point[0]), float(point[1]), float(sources[index]))
             for index, point in merged.items()
@@ -3151,14 +3397,25 @@ class PoseFeatureTracker:
         features.pose_detected = bool(self.last_landmarks) or bool(merged)
 
         current_world = self._current_world_points(float(now))
-        left_raw = build_foot_feature(merged, current_world, side="left")
-        right_raw = build_foot_feature(merged, current_world, side="right")
+        frame_aspect_ratio = float(gray.shape[1]) / max(1.0, float(gray.shape[0]))
+        left_raw = build_foot_feature(
+            merged,
+            current_world,
+            side="left",
+            qualities=point_quality,
+            frame_aspect_ratio=frame_aspect_ratio,
+        )
+        right_raw = build_foot_feature(
+            merged,
+            current_world,
+            side="right",
+            qualities=point_quality,
+            frame_aspect_ratio=frame_aspect_ratio,
+        )
         if left_raw is not None:
-            left_raw = left_raw.copy()
-            left_raw[15:] *= self.world_feature_weight
+            left_raw.validity[FOOT_WORLD_FEATURE_START:] *= self.world_feature_weight
         if right_raw is not None:
-            right_raw = right_raw.copy()
-            right_raw[15:] *= self.world_feature_weight
+            right_raw.validity[FOOT_WORLD_FEATURE_START:] *= self.world_feature_weight
         (
             features.left_foot,
             features.left_foot_ok,
@@ -3204,15 +3461,13 @@ class PoseFeatureTracker:
 
     def _patch_offsets(self) -> np.ndarray:
         radius = self.patch_radius
+        if self.patch_grid_size <= 1:
+            return np.zeros((1, 2), dtype=np.float32)
+        coordinates = np.linspace(
+            -radius, radius, self.patch_grid_size, dtype=np.float32
+        )
         return np.array(
-            [
-                [0.0, 0.0],
-                [radius, 0.0],
-                [-radius, 0.0],
-                [0.0, radius],
-                [0.0, -radius],
-            ],
-            dtype=np.float32,
+            [(x, y) for y in coordinates for x in coordinates], dtype=np.float32
         )
 
     def _track_point_clouds(
@@ -3224,7 +3479,7 @@ class PoseFeatureTracker:
         validate_backward: bool = False,
         long_range: bool = False,
     ) -> dict[int, np.ndarray]:
-        """Track five texture samples around every semantic landmark.
+        """Track a small texture grid around every semantic landmark.
 
         The OpenCV call and all vote aggregation are batched. This avoids a
         Python loop and median allocation for every landmark, which is important
@@ -4017,15 +4272,20 @@ class PoseFeatureTracker:
         flow_points: dict[int, np.ndarray],
         frame_shape: tuple[int, int],
         now: float,
-    ) -> tuple[dict[int, np.ndarray], dict[int, float]]:
+    ) -> tuple[dict[int, np.ndarray], dict[int, float], dict[int, float]]:
         height, width = frame_shape[:2]
         merged: dict[int, np.ndarray] = {}
         sources: dict[int, float] = {}
+        quality: dict[int, float] = {}
         scale = np.array([width, height], dtype=np.float64)
         for index in self.tracked_point_indices:
             ai_point = ai_points.get(index)
             confidence = float(ai_confidences.get(index, 0.0))
             support = clip(float(self._anchor_point_support.get(index, 1.0)), 0.0, 1.0)
+            support_for_quality = support if self.segmentation_enabled else 1.0
+            ai_quality = math.sqrt(
+                clip(confidence, 0.0, 1.0) * clip(support_for_quality, 0.0, 1.0)
+            )
             flow_point = flow_points.get(index)
             ai_is_strong = (
                 ai_point is not None
@@ -4070,13 +4330,27 @@ class PoseFeatureTracker:
                         else:
                             merged[index] = flow_point
                             sources[index] = 0.80
+                            anchor_age = now - self.last_ai_anchor.get(index, -1e9)
+                            decay = 1.0 - 0.03 * clip(
+                                max(0.0, anchor_age)
+                                / max(1e-6, self.flow_hold_seconds),
+                                0.0,
+                                1.0,
+                            )
+                            quality[index] = clip(
+                                self.last_ai_quality.get(index, 0.0) * decay,
+                                0.0,
+                                1.0,
+                            )
                             continue
                 else:
                     point = ai_point
                     self.anchor_mismatch_counts[index] = 0
                 merged[index] = point
                 sources[index] = 1.0
+                quality[index] = ai_quality
                 self.last_ai_anchor[index] = now
+                self.last_ai_quality[index] = ai_quality
                 continue
 
             anchor_age = now - self.last_ai_anchor.get(index, -1e9)
@@ -4097,7 +4371,17 @@ class PoseFeatureTracker:
                         flow_point = (1.0 - correction) * flow_point + correction * ai_point
                 merged[index] = flow_point
                 sources[index] = 0.72
-        return merged, sources
+                decay = 1.0 - 0.03 * clip(
+                    max(0.0, anchor_age)
+                    / max(1e-6, self.flow_hold_seconds),
+                    0.0,
+                    1.0,
+                )
+                flow_quality = self.last_ai_quality.get(index, 0.0) * decay
+                if ai_is_soft:
+                    flow_quality = max(flow_quality, ai_quality * 0.60)
+                quality[index] = clip(flow_quality, 0.0, 1.0)
+        return merged, sources, quality
 
     def _update_world_points_from_anchor(
         self,
@@ -4129,10 +4413,10 @@ class PoseFeatureTracker:
     def _stabilize_foot(
         self,
         side: str,
-        raw: Optional[np.ndarray],
+        raw: Optional[FootFeatureObservation],
         now: float,
         dt: float,
-    ) -> tuple[Optional[np.ndarray], bool, bool]:
+    ) -> tuple[Optional[FootFeatureObservation], bool, bool]:
         if side == "left":
             filter_object = self.left_filter
             last_feature = self.last_left_feature
@@ -4142,12 +4426,27 @@ class PoseFeatureTracker:
             last_feature = self.last_right_feature
             last_time = self.last_right_time
 
+        core_threshold = clip(
+            float(self.config.get("foot_core_min_confidence", 0.24)), 0.05, 1.0
+        )
+        if raw is not None and raw.confidence < core_threshold:
+            raw = None
+
         if raw is not None:
-            filtered = filter_object.update(raw, dt)
-            output = filtered
+            filter_input = raw.values.copy()
+            if last_feature is not None:
+                missing = raw.validity < 0.05
+                filter_input[missing] = last_feature.values[missing]
+            filtered = filter_object.update(filter_input, dt)
+            output_values = filtered
             if self.pedals_only:
                 raw_blend = clip(float(self.config.get("pedal_raw_feature_blend", 0.0)), 0.0, 1.0)
-                output = raw_blend * raw + (1.0 - raw_blend) * filtered
+                output_values = raw_blend * filter_input + (1.0 - raw_blend) * filtered
+            output = FootFeatureObservation(
+                values=np.asarray(output_values, dtype=np.float64),
+                validity=raw.validity.copy(),
+                confidence=float(raw.confidence),
+            )
             if side == "left":
                 self.last_left_feature = output.copy()
                 self.last_left_time = now
@@ -4167,26 +4466,51 @@ class PoseFeatureTracker:
         return None, False, False
 
 
+FOOT_FEATURE_DIMENSION = 15
+FOOT_WORLD_FEATURE_START = 12
+
+
+def shin_local_components(
+    vector: np.ndarray,
+    shin_unit: np.ndarray,
+    shin_length: float,
+) -> np.ndarray:
+    """Express a vector in a rotation/scale-invariant shin coordinate frame."""
+
+    vector = np.asarray(vector, dtype=np.float64)
+    shin_unit = np.asarray(shin_unit, dtype=np.float64)
+    across = np.array([-shin_unit[1], shin_unit[0]], dtype=np.float64)
+    scale = max(1e-8, float(shin_length))
+    return np.array(
+        [float(np.dot(vector, shin_unit)) / scale, float(np.dot(vector, across)) / scale],
+        dtype=np.float64,
+    )
+
+
 def build_foot_feature(
     points: dict[int, np.ndarray],
     world_points: dict[int, np.ndarray],
     side: str,
-) -> Optional[np.ndarray]:
-    """Create a dimensionless multi-signal foot feature.
+    qualities: Optional[dict[int, float]] = None,
+    frame_aspect_ratio: float = 1.0,
+) -> Optional[FootFeatureObservation]:
+    """Build shin-local foot articulation that survives camera/body rotation.
 
-    It combines foot direction, toe/heel motion relative to the knee and ankle,
-    ankle angle, apparent foot length, and low-weight 3-D world cues. Unlike the old unit-only
-    vector, it preserves small translation as well as rotation.
+    Knee, ankle, and toe are the stable core. Heel, hip, and world cues are
+    optional and carry explicit zero validity when absent, so a dropout can
+    never masquerade as a real zero-valued movement.
     """
     if side == "left":
-        knee_index, ankle_index, heel_index, toe_index = (
+        hip_index, knee_index, ankle_index, heel_index, toe_index = (
+            LEFT_HIP,
             LEFT_KNEE,
             LEFT_ANKLE,
             LEFT_HEEL,
             LEFT_FOOT_INDEX,
         )
     elif side == "right":
-        knee_index, ankle_index, heel_index, toe_index = (
+        hip_index, knee_index, ankle_index, heel_index, toe_index = (
+            RIGHT_HIP,
             RIGHT_KNEE,
             RIGHT_ANKLE,
             RIGHT_HEEL,
@@ -4195,101 +4519,117 @@ def build_foot_feature(
     else:
         raise ValueError("side must be 'left' or 'right'")
 
-    toe = points.get(toe_index)
-    ankle = points.get(ankle_index)
-    heel = points.get(heel_index)
-    knee = points.get(knee_index)
-    if toe is None or (ankle is None and heel is None):
+    aspect = max(1e-6, float(frame_aspect_ratio))
+
+    def metric_point(index: int) -> Optional[np.ndarray]:
+        point = points.get(index)
+        if point is None:
+            return None
+        value = np.asarray(point, dtype=np.float64).copy()
+        if value.size < 2:
+            return None
+        value[0] *= aspect
+        return value[:2]
+
+    hip = metric_point(hip_index)
+    knee = metric_point(knee_index)
+    ankle = metric_point(ankle_index)
+    heel = metric_point(heel_index)
+    toe = metric_point(toe_index)
+    if knee is None or ankle is None or toe is None:
         return None
-    origin = ankle if ankle is not None else heel
-    assert origin is not None
-    foot_vector = toe - origin
-    foot_unit = unit_vector(foot_vector)
-    if foot_unit is None:
+
+    shin_vector = np.asarray(ankle, dtype=np.float64) - np.asarray(knee, dtype=np.float64)
+    shin_length = float(np.linalg.norm(shin_vector))
+    shin_unit = unit_vector(shin_vector)
+    if shin_unit is None or shin_length < 0.015:
         return None
+
+    def quality(*indices: int) -> float:
+        if qualities is None:
+            return 1.0
+        return clip(
+            min(float(qualities.get(index, 0.0)) for index in indices),
+            0.0,
+            1.0,
+        )
+
+    values = np.zeros(FOOT_FEATURE_DIMENSION, dtype=np.float64)
+    validity = np.zeros(FOOT_FEATURE_DIMENSION, dtype=np.float64)
+    core_quality = quality(knee_index, ankle_index, toe_index)
+    toe_vector = np.asarray(toe, dtype=np.float64) - np.asarray(ankle, dtype=np.float64)
+    toe_unit = unit_vector(toe_vector)
+    if toe_unit is None:
+        return None
+    toe_length_ratio = float(np.linalg.norm(toe_vector)) / shin_length
+    if not 0.02 <= toe_length_ratio <= 1.50:
+        return None
+    values[0:2] = np.clip(
+        shin_local_components(toe_vector, shin_unit, shin_length), -3.0, 3.0
+    )
+    values[2:4] = shin_local_components(toe_unit, shin_unit, 1.0)
+    values[4] = toe_length_ratio
+    validity[0:5] = core_quality
 
     if heel is not None:
-        heel_toe_unit = unit_vector(toe - heel)
-    else:
-        heel_toe_unit = None
-    if heel_toe_unit is None:
-        heel_toe_unit = foot_unit
+        heel_vector = np.asarray(heel, dtype=np.float64) - np.asarray(ankle, dtype=np.float64)
+        sole_vector = np.asarray(toe, dtype=np.float64) - np.asarray(heel, dtype=np.float64)
+        sole_unit = unit_vector(sole_vector)
+        heel_length_ratio = float(np.linalg.norm(heel_vector)) / shin_length
+        sole_length_ratio = float(np.linalg.norm(sole_vector)) / shin_length
+        # A blanket point can be finite and confident yet geometrically
+        # impossible. Treat implausible heel geometry exactly like a missing
+        # heel so the stable knee/ankle/toe core continues to drive the pedal.
+        heel_plausible = (
+            0.015 <= heel_length_ratio <= 0.80
+            and 0.04 <= sole_length_ratio <= 1.50
+        )
+        if sole_unit is not None and heel_plausible:
+            heel_quality = quality(knee_index, ankle_index, heel_index, toe_index)
+            values[5:7] = np.clip(
+                shin_local_components(heel_vector, shin_unit, shin_length), -3.0, 3.0
+            )
+            values[7:9] = shin_local_components(sole_unit, shin_unit, 1.0)
+            values[9] = sole_length_ratio
+            validity[5:10] = heel_quality
 
-    has_shin = knee is not None and ankle is not None
-    if has_shin:
-        assert knee is not None and ankle is not None
-        shin_vector = ankle - knee
-        shin_length = float(np.linalg.norm(shin_vector))
-        shin_unit = unit_vector(shin_vector)
-        if shin_unit is None or shin_length < 0.015:
-            has_shin = False
-    if not has_shin:
-        shin_length = max(float(np.linalg.norm(foot_vector)) * 3.0, 0.03)
-        shin_unit = np.zeros(2, dtype=np.float64)
+    if hip is not None:
+        thigh_vector = np.asarray(knee, dtype=np.float64) - np.asarray(hip, dtype=np.float64)
+        thigh_unit = unit_vector(thigh_vector)
+        thigh_ratio = float(np.linalg.norm(thigh_vector)) / shin_length
+        if thigh_unit is not None and 0.30 <= thigh_ratio <= 3.00:
+            values[10:12] = shin_local_components(thigh_unit, shin_unit, 1.0)
+            validity[10:12] = quality(hip_index, knee_index, ankle_index)
 
-    if has_shin:
-        assert knee is not None and ankle is not None
-        toe_relative = np.clip((toe - knee) / shin_length, -3.0, 3.0)
-        heel_reference = heel if heel is not None else ankle
-        heel_relative = np.clip((heel_reference - knee) / shin_length, -3.0, 3.0)
-        angle_dot = float(np.dot(shin_unit, foot_unit))
-        angle_cross = float(shin_unit[0] * foot_unit[1] - shin_unit[1] * foot_unit[0])
-    else:
-        toe_relative = np.clip((toe - origin) / shin_length, -3.0, 3.0)
-        heel_relative = np.zeros(2, dtype=np.float64)
-        angle_dot = 0.0
-        angle_cross = 0.0
-    foot_length_ratio = clip(float(np.linalg.norm(foot_vector)) / shin_length, 0.0, 2.0)
-    ankle_reference = ankle if ankle is not None else origin
-    ankle_to_toe = np.clip((toe - ankle_reference) / shin_length, -2.0, 2.0)
-    heel_reference = heel if heel is not None else ankle_reference
-    ankle_to_heel = np.clip((heel_reference - ankle_reference) / shin_length, -2.0, 2.0)
-
-    world_foot_unit = np.zeros(3, dtype=np.float64)
-    world_toe_relative = np.zeros(3, dtype=np.float64)
-    world_angle_dot = 0.0
     world_toe = world_points.get(toe_index)
-    world_origin = world_points.get(ankle_index)
-    if world_origin is None:
-        world_origin = world_points.get(heel_index)
     world_knee = world_points.get(knee_index)
     world_ankle = world_points.get(ankle_index)
-    if world_toe is not None and world_origin is not None:
-        candidate = unit_vector(world_toe - world_origin)
-        if candidate is not None:
-            world_foot_unit = candidate
     if world_toe is not None and world_knee is not None and world_ankle is not None:
-        world_shin = world_ankle - world_knee
+        world_shin = np.asarray(world_ankle) - np.asarray(world_knee)
+        world_foot = np.asarray(world_toe) - np.asarray(world_ankle)
         world_shin_length = float(np.linalg.norm(world_shin))
         world_shin_unit = unit_vector(world_shin)
-        if world_shin_unit is not None and world_shin_length >= 1e-4:
-            world_toe_relative = np.clip(
-                (world_toe - world_knee) / world_shin_length,
-                -3.0,
-                3.0,
-            )
-            world_angle_dot = float(np.dot(world_shin_unit, world_foot_unit))
+        world_foot_unit = unit_vector(world_foot)
+        if (
+            world_shin_unit is not None
+            and world_foot_unit is not None
+            and world_shin_length >= 1e-4
+        ):
+            values[12] = clip(float(np.dot(world_shin_unit, world_foot_unit)), -1.0, 1.0)
+            values[13] = clip(float(np.linalg.norm(np.cross(world_shin_unit, world_foot_unit))), 0.0, 1.0)
+            values[14] = clip(float(np.linalg.norm(world_foot)) / world_shin_length, 0.0, 3.0)
+            validity[12:15] = core_quality
 
-    feature = np.concatenate(
-        (
-            foot_unit,
-            heel_toe_unit,
-            toe_relative,
-            heel_relative,
-            ankle_to_toe,
-            ankle_to_heel,
-            np.array([angle_dot, angle_cross, foot_length_ratio], dtype=np.float64),
-            world_foot_unit * 0.35,
-            world_toe_relative * 0.18,
-            np.array([world_angle_dot * 0.20], dtype=np.float64),
-        )
-    )
-    if feature.shape != (22,) or not np.all(np.isfinite(feature)):
+    if not np.all(np.isfinite(values)) or not np.all(np.isfinite(validity)):
         return None
-    return feature
+    return FootFeatureObservation(values=values, validity=validity, confidence=core_quality)
 
 
-def extract_pose_features(result: Any, confidence_threshold: float) -> PoseFeatures:
+def extract_pose_features(
+    result: Any,
+    confidence_threshold: float,
+    frame_aspect_ratio: float = 1.0,
+) -> PoseFeatures:
     """Compatibility wrapper without optical flow for third-party callers/tests."""
     features = PoseFeatures()
     pose_lists = getattr(result, "pose_landmarks", None)
@@ -4316,8 +4656,18 @@ def extract_pose_features(result: Any, confidence_threshold: float) -> PoseFeatu
         index: (float(point[0]), float(point[1]), 1.0)
         for index, point in points.items()
     }
-    features.left_foot = build_foot_feature(points, world_points, "left")
-    features.right_foot = build_foot_feature(points, world_points, "right")
+    features.left_foot = build_foot_feature(
+        points,
+        world_points,
+        "left",
+        frame_aspect_ratio=frame_aspect_ratio,
+    )
+    features.right_foot = build_foot_feature(
+        points,
+        world_points,
+        "right",
+        frame_aspect_ratio=frame_aspect_ratio,
+    )
     features.left_foot_ok = features.left_foot is not None
     features.right_foot_ok = features.right_foot is not None
     features.left_foot_fresh = features.left_foot_ok
@@ -4349,6 +4699,31 @@ def resize_to_width(frame: np.ndarray, width: int) -> np.ndarray:
     width = max(160, int(width))
     height = int(round(frame.shape[0] * width / frame.shape[1]))
     return cv2.resize(frame, (width, height), interpolation=cv2.INTER_AREA)
+
+
+def prepare_processing_frames(
+    frame: np.ndarray,
+    config: dict[str, Any],
+    enhancer: LowLightEnhancer,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Resize once, enhance once, then feed one image basis to AI and flow."""
+
+    tracking_width = int(
+        config.get("tracking_width", config.get("inference_width", 512))
+    )
+    processing_width = max(
+        tracking_width,
+        int(config.get("inference_width", tracking_width)),
+        int(config.get("preview_width", tracking_width)),
+    )
+    processing_frame = resize_to_width(frame, processing_width)
+    enhanced_frame = enhancer.apply(processing_frame)
+    tracking_frame = (
+        enhanced_frame
+        if enhanced_frame.shape[1] == tracking_width
+        else resize_to_width(enhanced_frame, tracking_width)
+    )
+    return enhanced_frame, tracking_frame
 
 
 def make_preview_qimage(frame: np.ndarray, features: PoseFeatures, config: dict[str, Any]) -> QImage:
@@ -4573,28 +4948,31 @@ def load_config(path: Path) -> dict[str, Any]:
             raise ValueError(f"Unknown config key(s): {', '.join(unknown)}")
 
         loaded_version = int(loaded.get("config_version", 1))
-        if loaded_version < 5:
-            if loaded_version < 4:
-                # Very old configurations did not contain the high-rate pedal
-                # pipeline.  Preserve physical camera/layout choices and apply
-                # the complete current tracking profile.
-                preserved_keys = {
-                    "camera_index",
-                    "camera_rotation_degrees",
-                    "mirror_preview",
-                    "monitor_index",
-                    "show_camera_preview",
-                    "auto_calibrate",
-                    "swap_pedals",
-                    "invert_steering",
-                }
-                config.update(
-                    {key: value for key, value in loaded.items() if key in preserved_keys}
-                )
-            else:
-                # Keep v0.4 camera and pedal tuning, then replace only the
-                # tracking values needed by the new coherent-leg lock.
-                config.update(loaded)
+        if loaded_version > int(DEFAULT_CONFIG["config_version"]):
+            raise ValueError(
+                f"config_version {loaded_version} is newer than this application supports"
+            )
+        if loaded_version < 4:
+            # v0.1-v0.3 predate the camera-rate coherent-leg pipeline. Keep
+            # only physical layout choices and use the complete v0.6 profile.
+            preserved_keys = {
+                "camera_index",
+                "camera_rotation_degrees",
+                "mirror_preview",
+                "monitor_index",
+                "show_camera_preview",
+                "auto_calibrate",
+                "swap_pedals",
+                "invert_steering",
+            }
+            config.update(
+                {key: value for key, value in loaded.items() if key in preserved_keys}
+            )
+        else:
+            config.update(loaded)
+            if loaded_version == 4:
+                # Preserve v0.4 camera/pedal tuning, but apply the v0.5
+                # coherent-leg values before the v0.6 migration below.
                 config.update(
                     {
                         "ai_anchor_max_age_seconds": 0.42,
@@ -4621,13 +4999,49 @@ def load_config(path: Path) -> dict[str, Any]:
                         "optical_flow_hold_seconds": 0.34,
                     }
                 )
-            config["config_version"] = 5
-            old_label = {1: "0.1", 2: "0.2", 3: "0.3", 4: "0.4"}.get(
-                loaded_version,
-                str(loaded_version),
-            )
+
+        if loaded_version < 6:
+            # Only replace values that are still exactly the v0.5 defaults.
+            # Deliberate user tuning survives, while the old near-binary curve
+            # migrates to the finer endpoint-preserving v0.6 response.
+            v5_to_v6_defaults: dict[str, tuple[Any, Any]] = {
+                "optical_flow_min_patch_votes": (3, 4),
+                "pedal_raw_feature_blend": (0.97, 0.90),
+                "pedal_sensitivity": (2.20, 1.0),
+                "pedal_curve_exponent": (0.44, 1.0),
+                "throttle_sensitivity": (3.40, 1.0),
+                "brake_sensitivity": (2.25, 1.0),
+                "throttle_deadzone": (0.0015, 0.004),
+                "throttle_curve_exponent": (0.27, 1.0),
+                "brake_curve_exponent": (0.44, 1.0),
+                "throttle_initial_response": (0.05, 0.0),
+                "pedal_prediction_max_advance": (0.10, 0.035),
+            }
+            if loaded_version >= 4:
+                for key, (old_default, new_default) in v5_to_v6_defaults.items():
+                    current = config.get(key, old_default)
+                    same = (
+                        math.isclose(
+                            float(current),
+                            float(old_default),
+                            rel_tol=0.0,
+                            abs_tol=1e-9,
+                        )
+                        if isinstance(old_default, (int, float))
+                        else current == old_default
+                    )
+                    if same:
+                        config[key] = new_default
+            config["config_version"] = 6
+            old_label = {
+                1: "0.1",
+                2: "0.2",
+                3: "0.3",
+                4: "0.4",
+                5: "0.5",
+            }.get(loaded_version, str(loaded_version))
             backup_path = path.with_name(f"config.v{old_label}-backup.json")
-            temporary_path = path.with_name(path.name + ".v5.tmp")
+            temporary_path = path.with_name(path.name + ".v6.tmp")
             migration_saved = False
             try:
                 if not backup_path.exists():
@@ -4647,23 +5061,49 @@ def load_config(path: Path) -> dict[str, Any]:
                 except OSError:
                     pass
                 print(
-                    f"[Config] Could not save the v5 profile ({exc}); "
+                    f"[Config] Could not save the v6 profile ({exc}); "
                     "using it in memory for this run.",
                     flush=True,
                 )
             status = f" and saved {backup_path.name}" if migration_saved else ""
             print(
-                "[Config] Applied the v0.5 coherent leg-lock profile"
+                "[Config] Applied the v0.6 low-light articulated-foot profile"
                 f"{status}.",
                 flush=True,
             )
-        else:
-            config.update(loaded)
 
     mode = str(config.get("control_mode", "pedals_only")).strip().lower()
     if mode not in {"pedals_only", "feet_and_hands"}:
         raise ValueError("control_mode must be 'pedals_only' or 'feet_and_hands'")
     config["control_mode"] = mode
+
+    exposure_mode = str(config.get("camera_exposure_mode", "auto_lock")).strip().lower()
+    if exposure_mode not in {"unchanged", "auto", "auto_lock", "manual"}:
+        raise ValueError(
+            "camera_exposure_mode must be unchanged, auto, auto_lock, or manual"
+        )
+    config["camera_exposure_mode"] = exposure_mode
+
+    def require_range(key: str, minimum: float, maximum: float) -> None:
+        value = float(config[key])
+        if not minimum <= value <= maximum:
+            raise ValueError(f"{key} must be between {minimum:g} and {maximum:g}")
+
+    require_range("camera_warmup_seconds", 0.0, 5.0)
+    require_range("low_light_gamma", 0.2, 3.0)
+    require_range("low_light_clahe_clip_limit", 0.0, 8.0)
+    grid = int(config["low_light_clahe_grid_size"])
+    if not 2 <= grid <= 32:
+        raise ValueError("low_light_clahe_grid_size must be between 2 and 32")
+    patch_grid = int(config["optical_flow_patch_grid_size"])
+    if patch_grid not in {1, 3, 5}:
+        raise ValueError("optical_flow_patch_grid_size must be 1, 3, or 5")
+    require_range("pedal_min_feature_coverage", 0.05, 1.0)
+    require_range("pedal_direction_tolerance_degrees", 0.0, 89.0)
+    require_range("pedal_magnitude_blend", 0.0, 1.0)
+    require_range("foot_core_min_confidence", 0.05, 1.0)
+    require_range("throttle_response_boost", 0.0, 2.0)
+    require_range("brake_response_boost", 0.0, 2.0)
     return config
 
 

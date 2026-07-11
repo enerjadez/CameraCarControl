@@ -8,7 +8,7 @@ if not exist .venv\Scripts\python.exe (
 )
 call .venv\Scripts\activate.bat
 echo Close CameraDrive and every other program using the webcam before continuing.
-echo This test will save the fastest measured camera mode into config.json.
+echo This test will save the best usable light, detail, and FPS mode into config.json.
 echo.
 python camera_fps_test.py --apply
 pause
