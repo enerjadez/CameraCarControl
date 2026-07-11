@@ -1,0 +1,17 @@
+# Local Python environment and caches
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Downloaded runtime assets
+models/
+
+# Machine-specific benchmark and migration output
+camera_fps_results.txt
+config.before-camera-benchmark.json
+config.v*-backup.json
+config.json.camera-test.tmp
+
+# Logs
+*.log
