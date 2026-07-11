@@ -10,12 +10,14 @@ The webcam estimates **pedal demand/travel**, not physical pressure or force. Me
 
 ## Install and calibrate
 
-1. Install 64-bit Python 3.11.
+Extract the complete ZIP into a writable folder such as Documents; do not run the batch files from inside the compressed-file preview. Internet access is required during installation and the first pose-model download.
+
+1. Install 64-bit Python 3.11 with the Windows `py` launcher.
 2. Run `install.bat`.
 3. Put the camera and lighting in their normal playing positions, then run `run_camera_fps_test_and_apply.bat`.
 4. Run `run_preview_max_leg_accuracy.bat`.
 5. Press **F9** and calibrate with relaxed, very small foot movements.
-6. When tracking is stable, run `install_gamepad_backend.bat` once and restart Windows after its driver installation.
+6. When tracking is stable, run `install_gamepad_backend.bat`. It installs the Python backend, launches the bundled x64 virtual-controller driver with a Windows administrator prompt when needed, and verifies that a controller can be created. Restart Windows if prompted.
 7. Run `run_max_leg_accuracy_windowed.bat`, press **F8**, and test the triggers with `joy.cpl`.
 8. Use `run_max_leg_accuracy.bat` for the transparent in-game overlay.
 
