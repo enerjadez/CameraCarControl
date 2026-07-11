@@ -1,25 +1,25 @@
-# CameraDrive AI 0.5.0 clean-package manifest
-
-This package contains only the max-leg-accuracy pedals workflow and its required setup files.
+# CameraDrive AI 0.6.0 manifest
 
 | File | Purpose |
 |---|---|
-| `camera_drive.py` | Main camera, AI tracking, calibration, HUD, and virtual-controller application |
-| `camera_fps_test.py` | Webcam mode benchmark and configuration helper |
-| `config.json` | Default v0.5.0 max-leg-accuracy configuration |
-| `install.bat` | Creates the Python 3.11 virtual environment and installs core dependencies |
+| `camera_drive.py` | Main AI tracking, articulated-foot calibration/mapping, HUD, and controller application |
+| `camera_imaging.py` | Shared camera controls, deterministic low-light enhancement, and light metrics |
+| `camera_fps_test.py` | Quality-aware webcam benchmark and configuration helper |
+| `config.json` | Default v0.6.0 low-light articulated-pedal configuration |
+| `install.bat` | Creates the Python 3.11 environment and installs core dependencies |
 | `install_gamepad_backend.bat` | Installs the optional virtual Xbox-controller backend |
-| `requirements.txt` | Core Python dependency list |
-| `requirements-gamepad.txt` | Virtual-controller dependency list |
-| `run_preview_max_leg_accuracy.bat` | Max-accuracy calibration and preview, without game output |
-| `run_max_leg_accuracy_windowed.bat` | Max-accuracy game output with a diagnostic window |
-| `run_max_leg_accuracy.bat` | Max-accuracy game output with a transparent overlay |
-| `run_camera_fps_test_and_apply.bat` | Measures webcam modes and applies the fastest reliable result |
-| `README.md` | Setup, calibration, game-use, and troubleshooting guide |
-| `LICENSE` | Software license |
-| `VERSION.txt` | Package version (`0.5.0`) |
-| `MANIFEST.md` | This file list |
+| `requirements.txt` | Core Python dependencies |
+| `requirements-gamepad.txt` | Virtual-controller dependency |
+| `run_preview_max_leg_accuracy.bat` | Max-accuracy calibration and preview without controller output |
+| `run_max_leg_accuracy_windowed.bat` | Max-accuracy output with a diagnostic window |
+| `run_max_leg_accuracy.bat` | Max-accuracy output with a transparent overlay |
+| `run_camera_fps_test_and_apply.bat` | Selects and applies the best usable webcam mode |
+| `run_tests.bat` | Runs the synthetic regression suite |
+| `tests/test_v06.py` | Low-light, camera-control, angle-invariance, mapping, migration, and benchmark tests |
+| `tests/config_v05_fixture.json` | Original v0.5 configuration fixture used to verify safe, idempotent migration |
+| `README.md` | Setup, calibration, configuration, game-use, and troubleshooting guide |
+| `LICENSE` | MIT license |
+| `VERSION.txt` | Application version (`0.6.0`) |
+| `.gitignore` | Excludes generated environments, models, reports, backups, and caches |
 
-Generated after installation and deliberately not bundled: `.venv/`, `models/`, configuration backups, and caches.
-
-Deliberately excluded: v0.1–v0.4 packages, upgrade overlays/notes, legacy and duplicate profile launchers, duplicate source trees, checksums, changelog, and test report.
+Generated and deliberately untracked: `.venv/`, `models/`, `__pycache__/`, camera reports, configuration backups, and temporary files.

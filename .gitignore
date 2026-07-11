@@ -12,6 +12,7 @@ camera_fps_results.txt
 config.before-camera-benchmark.json
 config.v*-backup.json
 config.json.camera-test.tmp
+config.json.v*.tmp
 
 # Logs
 *.log
