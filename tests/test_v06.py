@@ -45,12 +45,15 @@ class FakeCapture:
 
 
 def canonical_points(press: float = 0.0) -> dict[int, np.ndarray]:
+    angle = math.radians(-20.0 * float(press))
+    heel = np.array([0.0, 1.0], dtype=np.float64)
     return {
         cd.LEFT_HIP: np.array([0.0, -1.0]),
         cd.LEFT_KNEE: np.array([0.0, 0.0]),
-        cd.LEFT_ANKLE: np.array([0.0, 1.0]),
-        cd.LEFT_HEEL: np.array([-0.18, 1.0 - 0.08 * press]),
-        cd.LEFT_FOOT_INDEX: np.array([0.48 - 0.06 * press, 1.05 - 0.30 * press]),
+        cd.LEFT_ANKLE: np.array([0.0, 0.60]),
+        cd.LEFT_HEEL: heel,
+        cd.LEFT_FOOT_INDEX: heel
+        + 0.65 * np.array([math.cos(angle), math.sin(angle)], dtype=np.float64),
     }
 
 
@@ -223,63 +226,99 @@ class FootGeometryTests(unittest.TestCase):
         self.neutral = cd.build_foot_feature(canonical_points(0.0), {}, "left")
         self.pressed = cd.build_foot_feature(canonical_points(1.0), {}, "left")
         assert self.neutral is not None and self.pressed is not None
-        self.weights = np.minimum(self.neutral.validity, self.pressed.validity)
-        self.noise = np.full(cd.FOOT_FEATURE_DIMENSION, 0.003)
 
-    def project(self, observation: cd.FootFeatureObservation):
-        return cd.project_pedal(
+    @staticmethod
+    def project(
+        observation: cd.FootFeatureObservation,
+        neutral: cd.FootFeatureObservation,
+        pressed: cd.FootFeatureObservation,
+    ):
+        return cd.project_heel_hinge(
             observation,
-            self.neutral.values,
-            self.pressed.values,
-            noise=self.noise,
-            calibration_weights=self.weights,
-            minimum_coverage=0.35,
-            direction_tolerance_degrees=55.0,
-            magnitude_blend=0.25,
+            neutral.values,
+            pressed.values,
+            minimum_tilt_degrees=2.0,
+            extension_weight=0.0,
         )
 
     def test_similarity_transform_invariance(self) -> None:
         for press in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
             canonical = cd.build_foot_feature(canonical_points(press), {}, "left")
             assert canonical is not None
-            canonical_value = self.project(canonical)
+            canonical_value = self.project(canonical, self.neutral, self.pressed)
             for angle in (-75.0, -35.0, 0.0, 40.0, 75.0):
                 for scale in (0.6, 1.0, 1.8):
-                    transformed = cd.build_foot_feature(
+                    transformed_neutral = cd.build_foot_feature(
+                        transform_points(
+                            canonical_points(0.0), angle, scale, (2.3, -0.8)
+                        ),
+                        {},
+                        "left",
+                    )
+                    transformed_pressed = cd.build_foot_feature(
+                        transform_points(
+                            canonical_points(1.0), angle, scale, (2.3, -0.8)
+                        ),
+                        {},
+                        "left",
+                    )
+                    transformed_current = cd.build_foot_feature(
                         transform_points(
                             canonical_points(press), angle, scale, (2.3, -0.8)
                         ),
                         {},
                         "left",
                     )
-                    assert transformed is not None
-                    np.testing.assert_allclose(
-                        transformed.values[:12], canonical.values[:12], atol=1e-9
-                    )
+                    assert transformed_neutral is not None
+                    assert transformed_pressed is not None
+                    assert transformed_current is not None
                     self.assertAlmostEqual(
-                        float(self.project(transformed)), float(canonical_value), places=7
+                        float(
+                            self.project(
+                                transformed_current,
+                                transformed_neutral,
+                                transformed_pressed,
+                            )
+                        ),
+                        float(canonical_value),
+                        places=7,
                     )
 
     def test_non_square_camera_rotation_invariance(self) -> None:
         aspect = 640.0 / 480.0
         for press in (0.0, 0.25, 0.5, 1.0):
-            reference = cd.build_foot_feature(
-                pixel_rotated_normalized_points(canonical_points(press), 0.0),
-                {},
-                "left",
-                frame_aspect_ratio=aspect,
-            )
-            assert reference is not None
             for angle in (-75.0, -30.0, 30.0, 75.0, 90.0):
-                rotated = cd.build_foot_feature(
+                rotated_neutral = cd.build_foot_feature(
+                    pixel_rotated_normalized_points(canonical_points(0.0), angle),
+                    {},
+                    "left",
+                    frame_aspect_ratio=aspect,
+                )
+                rotated_pressed = cd.build_foot_feature(
+                    pixel_rotated_normalized_points(canonical_points(1.0), angle),
+                    {},
+                    "left",
+                    frame_aspect_ratio=aspect,
+                )
+                rotated_current = cd.build_foot_feature(
                     pixel_rotated_normalized_points(canonical_points(press), angle),
                     {},
                     "left",
                     frame_aspect_ratio=aspect,
                 )
-                assert rotated is not None
-                np.testing.assert_allclose(
-                    rotated.values[:12], reference.values[:12], atol=1e-9
+                assert rotated_neutral is not None
+                assert rotated_pressed is not None
+                assert rotated_current is not None
+                self.assertAlmostEqual(
+                    float(
+                        self.project(
+                            rotated_current,
+                            rotated_neutral,
+                            rotated_pressed,
+                        )
+                    ),
+                    press,
+                    places=7,
                 )
 
     def test_projection_tracks_press_fraction(self) -> None:
@@ -287,50 +326,44 @@ class FootGeometryTests(unittest.TestCase):
         for press in (0.0, 0.1, 0.25, 0.5, 0.75, 1.0):
             observation = cd.build_foot_feature(canonical_points(press), {}, "left")
             assert observation is not None
-            values.append(float(self.project(observation)))
+            values.append(float(self.project(observation, self.neutral, self.pressed)))
         expected = (0.0, 0.1, 0.25, 0.5, 0.75, 1.0)
         np.testing.assert_allclose(values, expected, atol=0.015)
 
-    def test_missing_heel_is_masked_not_encoded_as_movement(self) -> None:
-        points = canonical_points(0.5)
-        points.pop(cd.LEFT_HEEL)
-        observation = cd.build_foot_feature(points, {}, "left")
-        assert observation is not None
-        self.assertTrue(np.all(observation.validity[5:10] == 0.0))
-        value = self.project(observation)
-        self.assertIsNotNone(value)
-        self.assertAlmostEqual(float(value), 0.5, delta=0.06)
-
-    def test_missing_core_is_unavailable(self) -> None:
-        for missing in (cd.LEFT_KNEE, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX):
+    def test_missing_triangle_vertex_is_unavailable(self) -> None:
+        for missing in (cd.LEFT_HEEL, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX):
             points = canonical_points(0.5)
             points.pop(missing)
             self.assertIsNone(cd.build_foot_feature(points, {}, "left"))
 
-    def test_implausible_heel_is_masked_like_a_missing_heel(self) -> None:
+    def test_degenerate_heel_invalidates_the_triangle(self) -> None:
         points = canonical_points(0.5)
-        points[cd.LEFT_HEEL] = np.array([9.0, -7.0])
-        observation = cd.build_foot_feature(points, {}, "left")
-        assert observation is not None
-        self.assertTrue(np.all(observation.validity[5:10] == 0.0))
-        self.assertAlmostEqual(float(self.project(observation)), 0.5, delta=0.06)
+        points[cd.LEFT_HEEL] = points[cd.LEFT_ANKLE].copy()
+        self.assertIsNone(cd.build_foot_feature(points, {}, "left"))
 
-    def test_off_axis_motion_is_rejected(self) -> None:
-        observation = cd.FootFeatureObservation(
-            values=np.array([1.0, 100.0]),
-            validity=np.ones(2),
-            confidence=1.0,
-        )
-        value = cd.project_pedal(
-            observation,
-            neutral=np.zeros(2),
-            pressed=np.array([1.0, 0.0]),
-            noise=np.ones(2),
-            calibration_weights=np.ones(2),
-            direction_tolerance_degrees=55.0,
-            magnitude_blend=0.25,
-        )
+    def test_reverse_heel_tilt_is_rejected(self) -> None:
+        reverse = cd.build_foot_feature(canonical_points(-0.4), {}, "left")
+        assert reverse is not None
+        value = self.project(reverse, self.neutral, self.pressed)
         self.assertEqual(value, 0.0)
+
+    def test_only_the_three_triangle_points_affect_the_feature(self) -> None:
+        baseline = cd.build_foot_feature(canonical_points(0.5), {}, "left")
+        assert baseline is not None
+        changed_points = canonical_points(0.5)
+        changed_points[cd.LEFT_HIP] = np.array([800.0, -600.0])
+        changed_points[cd.LEFT_KNEE] = np.array([-700.0, 500.0])
+        changed = cd.build_foot_feature(
+            changed_points,
+            {
+                cd.LEFT_HEEL: np.array([100.0, 200.0, 300.0]),
+                cd.LEFT_ANKLE: np.array([-90.0, 80.0, -70.0]),
+                cd.LEFT_FOOT_INDEX: np.array([60.0, -50.0, 40.0]),
+            },
+            "left",
+        )
+        assert changed is not None
+        np.testing.assert_allclose(changed.values, baseline.values, atol=1e-12)
 
     def test_live_point_quality_preserves_real_confidence(self) -> None:
         config = dict(cd.DEFAULT_CONFIG)
@@ -338,7 +371,7 @@ class FootGeometryTests(unittest.TestCase):
         points = canonical_points(0.0)
         core = {
             index: points[index]
-            for index in (cd.LEFT_KNEE, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX)
+            for index in (cd.LEFT_HEEL, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX)
         }
         tracker._anchor_point_support = {index: 0.16 for index in core}
         merged, _sources, qualities = tracker._merge_points(
@@ -360,7 +393,7 @@ class FootGeometryTests(unittest.TestCase):
         points = canonical_points(0.0)
         core = {
             index: points[index]
-            for index in (cd.LEFT_KNEE, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX)
+            for index in (cd.LEFT_HEEL, cd.LEFT_ANKLE, cd.LEFT_FOOT_INDEX)
         }
         tracker._anchor_point_support = {index: 0.40 for index in core}
         merged, _sources, anchored_quality = tracker._merge_points(
@@ -413,13 +446,14 @@ class MappingCurveTests(unittest.TestCase):
         self.assertGreater(outputs[3] - outputs[2], 0.08)
         self.assertLess(outputs[-2], 0.95)
 
-    def test_full_controls_neutralize_projection_coverage_loss(self) -> None:
-        neutral = np.zeros(cd.FOOT_FEATURE_DIMENSION)
-        pressed = neutral.copy()
-        pressed[5] = 1.0
+    def test_full_controls_neutralize_invalid_triangle_observation(self) -> None:
+        neutral_observation = cd.build_foot_feature(canonical_points(0.0), {}, "left")
+        pressed_observation = cd.build_foot_feature(canonical_points(1.0), {}, "left")
+        assert neutral_observation is not None and pressed_observation is not None
+        neutral = neutral_observation.values
+        pressed = pressed_observation.values
         noise = np.full(cd.FOOT_FEATURE_DIMENSION, 0.003)
-        reliability = np.zeros(cd.FOOT_FEATURE_DIMENSION)
-        reliability[5] = 1.0
+        reliability = np.ones(cd.FOOT_FEATURE_DIMENSION)
         calibration = cd.CalibrationData(
             left_foot_neutral=neutral,
             left_foot_pressed=pressed,
@@ -438,14 +472,14 @@ class MappingCurveTests(unittest.TestCase):
         config = dict(cd.DEFAULT_CONFIG)
         config["control_mode"] = "feet_and_hands"
         mapper = cd.ControlMapper(calibration, config)
-        core_only = cd.FootFeatureObservation(
-            values=np.zeros(cd.FOOT_FEATURE_DIMENSION),
-            validity=np.r_[np.ones(5), np.zeros(cd.FOOT_FEATURE_DIMENSION - 5)],
+        invalid_triangle = cd.FootFeatureObservation(
+            values=neutral.copy(),
+            validity=np.zeros(cd.FOOT_FEATURE_DIMENSION),
             confidence=1.0,
         )
         features = cd.PoseFeatures(
-            left_foot=core_only,
-            right_foot=core_only,
+            left_foot=invalid_triangle,
+            right_foot=invalid_triangle,
             steering_angle=0.0,
             left_foot_ok=True,
             right_foot_ok=True,
@@ -475,7 +509,7 @@ class ConfigMigrationTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(v5), encoding="utf-8")
             migrated = cd.load_config(path)
-            self.assertEqual(migrated["config_version"], 6)
+            self.assertEqual(migrated["config_version"], 7)
             self.assertEqual(migrated["camera_index"], 3)
             self.assertEqual(migrated["capture_width"], 960)
             self.assertEqual(migrated["capture_fps"], 60)
@@ -488,10 +522,10 @@ class ConfigMigrationTests(unittest.TestCase):
             backup_contents = backup.read_text(encoding="utf-8")
             saved_contents = path.read_text(encoding="utf-8")
             second = cd.load_config(path)
-            self.assertEqual(second["config_version"], 6)
+            self.assertEqual(second["config_version"], 7)
             self.assertEqual(path.read_text(encoding="utf-8"), saved_contents)
             self.assertEqual(backup.read_text(encoding="utf-8"), backup_contents)
-            self.assertFalse((Path(directory) / "config.json.v6.tmp").exists())
+            self.assertFalse((Path(directory) / "config.json.v7.tmp").exists())
 
     def test_pre_v4_keeps_layout_but_not_obsolete_tracking_tuning(self) -> None:
         legacy = {
@@ -505,6 +539,7 @@ class ConfigMigrationTests(unittest.TestCase):
             path = Path(directory) / "config.json"
             path.write_text(json.dumps(legacy), encoding="utf-8")
             migrated = cd.load_config(path)
+            self.assertEqual(migrated["config_version"], 7)
             self.assertEqual(migrated["camera_index"], 2)
             self.assertEqual(migrated["camera_rotation_degrees"], 90)
             self.assertTrue(migrated["swap_pedals"])

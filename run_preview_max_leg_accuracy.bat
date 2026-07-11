@@ -7,6 +7,6 @@ if not exist .venv\Scripts\python.exe (
   exit /b 1
 )
 call .venv\Scripts\activate.bat
-rem Maximum leg/foot identity accuracy. Preview only; no virtual controller.
-python camera_drive.py --pedals-only --profile leg-lock --preview-only --windowed-hud
+rem Clickable six-point hard-lock setup. Preview only; no virtual controller.
+python camera_drive.py --pedals-only --profile leg-lock --preview-only --windowed-hud --anchor-setup
 if errorlevel 1 pause

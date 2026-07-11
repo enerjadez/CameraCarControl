@@ -14,6 +14,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-rem Maximum leg/foot identity accuracy with an ordinary diagnostic window.
-python camera_drive.py --pedals-only --profile leg-lock --windowed-hud
+rem Clickable six-point hard-lock setup with controller output.
+python camera_drive.py --pedals-only --profile leg-lock --windowed-hud --anchor-setup
 if errorlevel 1 pause

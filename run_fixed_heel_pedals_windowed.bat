@@ -14,6 +14,6 @@ if errorlevel 1 (
   pause
   exit /b 1
 )
-rem Hard-lock setup needs a clickable ordinary window; keep it open during play.
+rem Recommended fixed-heel triangle setup and controller launcher.
 python camera_drive.py --pedals-only --profile leg-lock --windowed-hud --anchor-setup
 if errorlevel 1 pause

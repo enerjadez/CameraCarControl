@@ -47,7 +47,7 @@ from camera_imaging import (
 
 
 APP_NAME = "CameraDrive AI"
-APP_VERSION = "0.6.0"
+APP_VERSION = "0.7.0"
 
 MODEL_URLS = {
     "lite": (
@@ -82,6 +82,24 @@ RIGHT_HEEL = 30
 LEFT_FOOT_INDEX = 31
 RIGHT_FOOT_INDEX = 32
 
+# Manual hard-lock order. The right accelerator foot is placed first so the
+# primary control is usable as quickly as possible.
+MANUAL_ANCHOR_SEQUENCE: tuple[tuple[int, str], ...] = (
+    (RIGHT_HEEL, "RIGHT HEEL — accelerator pivot"),
+    (RIGHT_ANKLE, "RIGHT ANKLE — triangle reference"),
+    (RIGHT_FOOT_INDEX, "RIGHT TOE / FOREFOOT"),
+    (LEFT_HEEL, "LEFT HEEL — brake pivot"),
+    (LEFT_ANKLE, "LEFT ANKLE — triangle reference"),
+    (LEFT_FOOT_INDEX, "LEFT TOE / FOREFOOT"),
+)
+MANUAL_FOOT_TRIANGLES: dict[str, tuple[int, int, int]] = {
+    "left": (LEFT_HEEL, LEFT_ANKLE, LEFT_FOOT_INDEX),
+    "right": (RIGHT_HEEL, RIGHT_ANKLE, RIGHT_FOOT_INDEX),
+}
+MANUAL_FOOT_ANCHOR_INDICES = frozenset(
+    index for indices in MANUAL_FOOT_TRIANGLES.values() for index in indices
+)
+
 POSE_CONNECTIONS: tuple[tuple[int, int], ...] = (
     (LEFT_SHOULDER, RIGHT_SHOULDER),
     (LEFT_SHOULDER, LEFT_ELBOW),
@@ -105,7 +123,7 @@ POSE_CONNECTIONS: tuple[tuple[int, int], ...] = (
 
 
 DEFAULT_CONFIG: dict[str, Any] = {
-    "config_version": 6,
+    "config_version": 7,
     # Feet-only is the default accessibility mode. The virtual left stick stays
     # centred so steering can come from a keyboard, wheel, or physical gamepad.
     "control_mode": "pedals_only",
@@ -228,6 +246,20 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "pedal_direction_tolerance_degrees": 55.0,
     "pedal_magnitude_blend": 0.25,
     "foot_core_min_confidence": 0.24,
+    # The fixed-heel workflow requires six user-selected points every session.
+    # Manual points are followed only by strict local optical flow; MediaPipe
+    # may identify the person but can never overwrite a confirmed point.
+    "manual_anchor_required": True,
+    "manual_anchor_min_separation_pixels": 6.0,
+    "manual_anchor_patch_grid_size": 5,
+    "manual_anchor_min_patch_votes": 9,
+    "manual_anchor_template_size_pixels": 17,
+    "manual_anchor_template_search_pixels": 7,
+    "manual_anchor_template_min_score": 0.38,
+    "manual_anchor_template_rotation_degrees": 14.0,
+    "manual_triangle_max_edge_change_ratio": 0.22,
+    "calibration_min_heel_tilt_degrees": 2.0,
+    "heel_extension_weight": 0.15,
     # A small, bounded rising-edge prediction offsets one camera frame of delay;
     # release is never predicted and still snaps to zero.
     "pedal_lookahead_seconds": 0.012,
@@ -408,6 +440,7 @@ class PoseFeatures:
     # Refined 2-D keypoints. The third value is 1.0 for a current AI anchor and
     # 0.65 for a point temporarily carried by verified optical flow.
     tracked_landmarks: dict[int, tuple[float, float, float]] = field(default_factory=dict)
+    hard_locked_indices: frozenset[int] = field(default_factory=frozenset)
 
     @property
     def pedals_ok(self) -> bool:
@@ -477,6 +510,13 @@ class UiSnapshot:
     camera_mode: str = "Camera is starting"
     preview: Optional[QImage] = None
     show_preview: bool = True
+    preview_mirrored: bool = True
+    anchor_setup_active: bool = False
+    anchor_setup_step: int = 0
+    anchor_setup_count: int = len(MANUAL_ANCHOR_SEQUENCE)
+    anchor_setup_label: str = ""
+    anchor_setup_points: dict[int, tuple[float, float]] = field(default_factory=dict)
+    anchor_input_available: bool = False
     fatal_error: str = ""
     exit_requested: bool = False
 
@@ -485,6 +525,7 @@ class SharedState:
     def __init__(self, show_preview: bool) -> None:
         self._lock = threading.RLock()
         self._snapshot = UiSnapshot(show_preview=show_preview)
+        self._anchor_clicks: list[tuple[float, float]] = []
 
     def update(self, **changes: Any) -> None:
         with self._lock:
@@ -496,6 +537,20 @@ class SharedState:
     def snapshot(self) -> UiSnapshot:
         with self._lock:
             return copy.copy(self._snapshot)
+
+    def submit_anchor_click(self, x: float, y: float) -> None:
+        with self._lock:
+            self._anchor_clicks.append((float(x), float(y)))
+
+    def take_anchor_clicks(self) -> list[tuple[float, float]]:
+        with self._lock:
+            clicks = self._anchor_clicks
+            self._anchor_clicks = []
+            return clicks
+
+    def clear_anchor_clicks(self) -> None:
+        with self._lock:
+            self._anchor_clicks = []
 
 
 @dataclass(frozen=True)
@@ -931,6 +986,7 @@ class HotkeyEdges:
     """Poll global Windows keys without stealing focus from the game."""
 
     VK_ESCAPE = 0x1B
+    VK_F7 = 0x76
     VK_F8 = 0x77
     VK_F9 = 0x78
     VK_F10 = 0x79
@@ -1031,11 +1087,11 @@ class CalibrationManager:
         ),
         (
             "gas",
-            "ACCELERATOR: make a TINY repeatable RIGHT-foot movement and hold it",
+            "ACCELERATOR: keep RIGHT heel planted, tilt the toe like a pedal, and hold",
         ),
         (
             "brake",
-            "BRAKE: make a TINY repeatable LEFT-foot movement and hold it",
+            "BRAKE: keep LEFT heel planted, tilt the toe like a pedal, and hold",
         ),
     )
     # Retained as a class-level compatibility alias; each instance selects its
@@ -1194,11 +1250,11 @@ class CalibrationManager:
         if "left foot" in requirements and (
             not features.left_foot_ok or not features.left_foot_fresh
         ):
-            missing.append("LEFT FOOT (fresh knee/ankle/toe tracking)")
+            missing.append("LEFT HEEL TRIANGLE (heel/ankle/toe hard lock)")
         if "right foot" in requirements and (
             not features.right_foot_ok or not features.right_foot_fresh
         ):
-            missing.append("RIGHT FOOT (fresh knee/ankle/toe tracking)")
+            missing.append("RIGHT HEEL TRIANGLE (heel/ankle/toe hard lock)")
         if "hands" in requirements and (
             not features.steering_ok or not features.steering_fresh
         ):
@@ -1322,6 +1378,32 @@ class CalibrationManager:
         )
         minimum_motion = max(1e-5, float(self.config["calibration_min_absolute_motion"]))
         minimum_snr = max(1.0, float(self.config["calibration_min_signal_to_noise"]))
+        minimum_heel_tilt = math.radians(
+            max(0.1, float(self.config.get("calibration_min_heel_tilt_degrees", 2.0)))
+        )
+        right_heel_tilt = abs(
+            wrap_angle(
+                math.atan2(float(gas_right[0]), float(gas_right[1]))
+                - math.atan2(float(neutral_right[0]), float(neutral_right[1]))
+            )
+        )
+        left_heel_tilt = abs(
+            wrap_angle(
+                math.atan2(float(brake_left[0]), float(brake_left[1]))
+                - math.atan2(float(neutral_left[0]), float(neutral_left[1]))
+            )
+        )
+
+        if right_heel_tilt < minimum_heel_tilt:
+            raise ValueError(
+                "right heel-to-toe tilt was too small; keep the heel planted and "
+                "make a tiny visible toe rotation"
+            )
+        if left_heel_tilt < minimum_heel_tilt:
+            raise ValueError(
+                "left heel-to-toe tilt was too small; keep the heel planted and "
+                "make a tiny visible toe rotation"
+            )
 
         if right_motion < minimum_motion or right_snr < minimum_snr:
             raise ValueError(
@@ -1393,30 +1475,21 @@ class ControlMapper:
         if side == "left":
             neutral = self.calibration.left_foot_neutral
             pressed = self.calibration.left_foot_pressed
-            noise = self.calibration.left_foot_noise
-            reliability = self.calibration.left_foot_reliability
             snr = self.calibration.left_foot_signal_to_noise
         elif side == "right":
             neutral = self.calibration.right_foot_neutral
             pressed = self.calibration.right_foot_pressed
-            noise = self.calibration.right_foot_noise
-            reliability = self.calibration.right_foot_reliability
             snr = self.calibration.right_foot_signal_to_noise
         else:
             raise ValueError("side must be 'left' or 'right'")
-        value = project_pedal(
+        value = project_heel_hinge(
             feature,
             neutral,
             pressed,
-            noise=noise,
-            calibration_weights=reliability,
-            noise_floor=float(self.config["pedal_noise_floor"]),
-            noise_multiplier=float(self.config["pedal_noise_multiplier"]),
-            minimum_coverage=float(self.config["pedal_min_feature_coverage"]),
-            direction_tolerance_degrees=float(
-                self.config["pedal_direction_tolerance_degrees"]
+            minimum_tilt_degrees=float(
+                self.config.get("calibration_min_heel_tilt_degrees", 2.0)
             ),
-            magnitude_blend=float(self.config["pedal_magnitude_blend"]),
+            extension_weight=float(self.config.get("heel_extension_weight", 0.15)),
         )
         if value is None:
             return None
@@ -1627,6 +1700,15 @@ class CameraDriveWorker(threading.Thread):
         self.fps_smoother = ExponentialSmoother(0.5)
         self._preview_enabled = bool(config["show_camera_preview"])
         self._last_calibration_console_state: Optional[tuple[int, str, str]] = None
+        self.anchor_setup_active = False
+        self.anchor_setup_points: dict[int, np.ndarray] = {}
+        self.anchor_setup_frame: Optional[np.ndarray] = None
+        self.anchor_setup_preview: Optional[QImage] = None
+        self.anchor_setup_requested = bool(
+            config.get("_anchor_setup_requested", False)
+            or config.get("manual_anchor_required", True)
+        )
+        self.windowed_hud = bool(config.get("_windowed_hud", False))
 
     def run(self) -> None:
         if bool(self.config.get("prefer_low_latency_thread_priorities", True)):
@@ -1691,7 +1773,9 @@ class CameraDriveWorker(threading.Thread):
                 ),
             )
 
-            if bool(self.config["auto_calibrate"]):
+            if self.anchor_setup_requested:
+                self._start_anchor_setup()
+            elif bool(self.config["auto_calibrate"]):
                 self._start_calibration(time.monotonic())
             else:
                 self.shared.update(
@@ -1774,6 +1858,9 @@ class CameraDriveWorker(threading.Thread):
                     anchor = latest_pose
                     last_pose_sequence = latest_pose.sequence
 
+                self._ensure_anchor_setup_frame(tracking_frame)
+                self._consume_anchor_clicks(tracking_frame, now)
+
                 features = self.pose_tracker.update(
                     frame=tracking_frame,
                     now=now,
@@ -1782,7 +1869,9 @@ class CameraDriveWorker(threading.Thread):
                     sequence=packet.sequence,
                 )
 
-                if self.calibration.active:
+                if self.anchor_setup_active:
+                    self._process_anchor_setup(features)
+                elif self.calibration.active:
                     self._process_calibration(features, now)
                 else:
                     self._process_controls(features, now, dt)
@@ -1801,7 +1890,11 @@ class CameraDriveWorker(threading.Thread):
                 if self.light_metrics is not None:
                     changes["light_luma"] = self.light_metrics.median_luma
                     changes["light_dark_fraction"] = self.light_metrics.dark_fraction
-                if self._preview_enabled and now - last_preview_at >= preview_interval:
+                if self.anchor_setup_active and self.anchor_setup_preview is not None:
+                    # Every setup click must refer to one immutable image. A
+                    # live preview would let early clicks age before click six.
+                    changes["preview"] = self.anchor_setup_preview
+                elif self._preview_enabled and now - last_preview_at >= preview_interval:
                     changes["preview"] = make_preview_qimage(
                         enhanced_frame, features, self.config
                     )
@@ -1860,10 +1953,22 @@ class CameraDriveWorker(threading.Thread):
             self._preview_enabled = not self._preview_enabled
             self.shared.update(show_preview=self._preview_enabled, preview=None if not self._preview_enabled else self.shared.snapshot().preview)
 
+        if self.hotkeys.pressed(HotkeyEdges.VK_F7):
+            self._start_anchor_setup()
+
         if self.hotkeys.pressed(HotkeyEdges.VK_F9):
-            self._start_calibration(time.monotonic())
+            if bool(self.config.get("manual_anchor_required", True)) and not self.pose_tracker.manual_anchors_complete:
+                self._start_anchor_setup()
+            else:
+                self._start_calibration(time.monotonic())
 
         if self.hotkeys.pressed(HotkeyEdges.VK_F8):
+            if self.anchor_setup_active:
+                self.shared.update(
+                    headline="Finish the six anchor clicks before enabling controls",
+                    prompt=self._anchor_prompt(),
+                )
+                return
             if self.calibration.complete and self.mapper is not None:
                 self.active = not self.active
                 if not self.active:
@@ -1903,7 +2008,220 @@ class CameraDriveWorker(threading.Thread):
                     active=False,
                 )
 
+    def _anchor_prompt(self) -> str:
+        step = len(self.anchor_setup_points)
+        if step >= len(MANUAL_ANCHOR_SEQUENCE):
+            return "Validating the fixed heel triangles"
+        return f"CLICK {step + 1}/6: {MANUAL_ANCHOR_SEQUENCE[step][1]}"
+
+    def _start_anchor_setup(self) -> None:
+        self.active = False
+        self.mapper = None
+        self.calibration.active = False
+        self.calibration.complete = False
+        self.anchor_setup_points = {}
+        self.anchor_setup_frame = None
+        self.anchor_setup_preview = None
+        self.shared.clear_anchor_clicks()
+        self.pose_tracker.clear_manual_foot_anchors()
+        self._preview_enabled = True
+        self._reset_controls()
+        if not self.windowed_hud:
+            self.anchor_setup_active = False
+            self.shared.update(
+                mode="ANCHOR SETUP REQUIRED",
+                headline="Fixed heel anchors need a clickable camera window",
+                detail="Run run_fixed_heel_pedals_windowed.bat",
+                prompt="Open the fixed-heel windowed launcher, then click the six points",
+                anchor_setup_active=False,
+                anchor_input_available=False,
+                calibrated=False,
+                active=False,
+                tracking_ok=False,
+                gas=0.0,
+                brake=0.0,
+                steering=0.0,
+                show_preview=True,
+            )
+            return
+        self.anchor_setup_active = True
+        self.shared.update(
+            mode="SET FOOT ANCHORS",
+            headline="Hard-lock the heel-pivot triangles",
+            detail="Click the exact points on the live image • F7 restarts",
+            prompt=self._anchor_prompt(),
+            anchor_setup_active=True,
+            anchor_setup_step=0,
+            anchor_setup_count=len(MANUAL_ANCHOR_SEQUENCE),
+            anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[0][1],
+            anchor_setup_points={},
+            anchor_input_available=False,
+            preview_mirrored=bool(self.config.get("mirror_preview", True)),
+            calibrated=False,
+            active=False,
+            tracking_ok=False,
+            gas=0.0,
+            brake=0.0,
+            steering=0.0,
+            show_preview=True,
+        )
+
+    def _ensure_anchor_setup_frame(self, tracking_frame: np.ndarray) -> None:
+        if not self.anchor_setup_active or self.anchor_setup_frame is not None:
+            return
+        self.anchor_setup_frame = np.ascontiguousarray(tracking_frame.copy())
+        self.anchor_setup_preview = make_preview_qimage(
+            self.anchor_setup_frame,
+            PoseFeatures(),
+            self.config,
+        )
+        self.shared.update(
+            preview=self.anchor_setup_preview,
+            anchor_input_available=True,
+            headline="Hard-lock the heel-pivot triangles",
+            detail="Camera image frozen for all six clicks • keep both feet still",
+            prompt=self._anchor_prompt(),
+        )
+
+    def _consume_anchor_clicks(
+        self,
+        tracking_frame: np.ndarray,
+        now: float,
+    ) -> None:
+        clicks = self.shared.take_anchor_clicks()
+        if not self.anchor_setup_active or self.anchor_setup_frame is None:
+            return
+        frame_shape = tracking_frame.shape
+        for x, y in clicks:
+            step = len(self.anchor_setup_points)
+            if step >= len(MANUAL_ANCHOR_SEQUENCE):
+                break
+            if not (0.0 <= x <= 1.0 and 0.0 <= y <= 1.0):
+                continue
+            index, _label = MANUAL_ANCHOR_SEQUENCE[step]
+            self.anchor_setup_points[index] = np.array([x, y], dtype=np.float64)
+            if len(self.anchor_setup_points) == len(MANUAL_ANCHOR_SEQUENCE):
+                error = validate_manual_anchor_points(
+                    self.anchor_setup_points,
+                    frame_shape,
+                    float(self.config.get("manual_anchor_min_separation_pixels", 6.0)),
+                )
+                if error:
+                    self.anchor_setup_points = {}
+                    self.shared.update(
+                        headline=f"Anchor setup restarted: {error}",
+                        prompt=self._anchor_prompt(),
+                        anchor_setup_step=0,
+                        anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[0][1],
+                        anchor_setup_points={},
+                    )
+                    continue
+                reference_gray = cv2.cvtColor(
+                    self.anchor_setup_frame,
+                    cv2.COLOR_BGR2GRAY,
+                )
+                current_gray = cv2.cvtColor(tracking_frame, cv2.COLOR_BGR2GRAY)
+                aligned = self.pose_tracker.align_manual_anchor_selection(
+                    reference_gray,
+                    current_gray,
+                    self.anchor_setup_points,
+                )
+                if set(aligned) != set(MANUAL_FOOT_ANCHOR_INDICES):
+                    self.anchor_setup_points = {}
+                    self.anchor_setup_frame = None
+                    self.anchor_setup_preview = None
+                    self.shared.update(
+                        headline="Anchor setup restarted: a selected texture moved or was lost",
+                        detail="Keep both feet still while selecting all six points",
+                        prompt="Freezing a new setup frame",
+                        anchor_setup_step=0,
+                        anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[0][1],
+                        anchor_setup_points={},
+                        anchor_input_available=False,
+                    )
+                    continue
+                aligned_error = validate_manual_anchor_points(
+                    aligned,
+                    current_gray.shape,
+                    float(self.config.get("manual_anchor_min_separation_pixels", 6.0)),
+                )
+                if aligned_error:
+                    self.anchor_setup_points = {}
+                    self.anchor_setup_frame = None
+                    self.anchor_setup_preview = None
+                    self.shared.update(
+                        headline=f"Anchor setup restarted: {aligned_error}",
+                        detail="Keep both feet still while selecting all six points",
+                        prompt="Freezing a new setup frame",
+                        anchor_setup_step=0,
+                        anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[0][1],
+                        anchor_setup_points={},
+                        anchor_input_available=False,
+                    )
+                    continue
+                try:
+                    self.pose_tracker.set_manual_foot_anchors(
+                        aligned,
+                        reference_gray=reference_gray,
+                        reference_points=self.anchor_setup_points,
+                    )
+                except ValueError as exc:
+                    self.anchor_setup_points = {}
+                    self.anchor_setup_frame = None
+                    self.anchor_setup_preview = None
+                    self.shared.update(
+                        headline=f"Anchor setup restarted: {exc}",
+                        detail="Choose visible textured skin, sock, or shoe points",
+                        prompt="Freezing a new setup frame",
+                        anchor_setup_step=0,
+                        anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[0][1],
+                        anchor_setup_points={},
+                        anchor_input_available=False,
+                    )
+                    continue
+                self.anchor_setup_active = False
+                self.anchor_setup_frame = None
+                self.anchor_setup_preview = None
+                self.shared.update(
+                    anchor_setup_active=False,
+                    anchor_input_available=False,
+                    anchor_setup_points={
+                        key: (float(value[0]), float(value[1]))
+                        for key, value in self.anchor_setup_points.items()
+                    },
+                )
+                self._start_calibration(now)
+                return
+            next_step = len(self.anchor_setup_points)
+            self.shared.update(
+                prompt=self._anchor_prompt(),
+                anchor_setup_step=next_step,
+                anchor_setup_label=MANUAL_ANCHOR_SEQUENCE[next_step][1],
+                anchor_setup_points={
+                    key: (float(value[0]), float(value[1]))
+                    for key, value in self.anchor_setup_points.items()
+                },
+            )
+
+    def _process_anchor_setup(self, features: PoseFeatures) -> None:
+        self._reset_controls(update_ui=False)
+        self.shared.update(
+            mode="SET FOOT ANCHORS",
+            prompt=self._anchor_prompt(),
+            left_foot_ok=False,
+            right_foot_ok=False,
+            steering_ok=False,
+            tracking_hint="Clicks are fixed to local foot texture; AI cannot overwrite them",
+            tracking_ok=False,
+            gas=0.0,
+            brake=0.0,
+            steering=0.0,
+        )
+
     def _start_calibration(self, now: float) -> None:
+        if bool(self.config.get("manual_anchor_required", True)) and not self.pose_tracker.manual_anchors_complete:
+            self._start_anchor_setup()
+            return
         self.active = False
         self.mapper = None
         self.calibration.start(now)
@@ -1941,6 +2259,8 @@ class CameraDriveWorker(threading.Thread):
             active=False,
             tracking_ok=False,
             show_preview=True,
+            anchor_setup_active=False,
+            anchor_input_available=False,
         )
 
     def _process_calibration(self, features: PoseFeatures, now: float) -> None:
@@ -1966,7 +2286,7 @@ class CameraDriveWorker(threading.Thread):
             self._last_calibration_console_state = console_state
         self.shared.update(
             mode="CALIBRATING" if not self.calibration.failed_reason else "CALIBRATION FAILED",
-            headline=headline_by_stage.get(stage, "Five-pose calibration"),
+            headline=headline_by_stage.get(stage, "Calibration"),
             detail=(
                 f"Pose {phase_number} of {len(self.calibration.PHASES)} • {stage}"
                 if not self.calibration.failed_reason
@@ -2184,7 +2504,7 @@ class CameraDriveWorker(threading.Thread):
             mode="TRACKING LOST",
             headline=headline,
             detail=(
-                "Keep both feet, knees, ankles, heels, and toes inside the camera view"
+                "Keep both hard-locked heel, ankle, and toe triangles visible"
                 if self.pedals_only
                 else "Keep both wrists and both feet inside the camera view"
             ),
@@ -2220,6 +2540,7 @@ class OverlayWindow(QWidget):
         self.stop_event = stop_event
         self.windowed_hud = bool(windowed_hud)
         self._last_snapshot = shared.snapshot()
+        self._anchor_image_rect = QRectF()
         self.setWindowTitle(APP_NAME)
 
         screens = QGuiApplication.screens()
@@ -2270,6 +2591,32 @@ class OverlayWindow(QWidget):
     def closeEvent(self, event: Any) -> None:
         self.stop_event.set()
         super().closeEvent(event)
+
+    def mousePressEvent(self, event: Any) -> None:
+        snapshot = self._last_snapshot
+        if (
+            self.windowed_hud
+            and snapshot.anchor_setup_active
+            and snapshot.anchor_input_available
+            and event.button() == Qt.MouseButton.LeftButton
+        ):
+            position = event.position()
+            point = preview_click_to_normalized(
+                float(position.x()),
+                float(position.y()),
+                (
+                    float(self._anchor_image_rect.left()),
+                    float(self._anchor_image_rect.top()),
+                    float(self._anchor_image_rect.width()),
+                    float(self._anchor_image_rect.height()),
+                ),
+                snapshot.preview_mirrored,
+            )
+            if point is not None:
+                self.shared.submit_anchor_click(*point)
+                event.accept()
+                return
+        super().mousePressEvent(event)
 
     def _tick(self) -> None:
         self._last_snapshot = self.shared.snapshot()
@@ -2355,9 +2702,13 @@ class OverlayWindow(QWidget):
         )
 
         calibration_visible = snapshot.mode in {"CALIBRATING", "CALIBRATION FAILED"}
-        if calibration_visible:
+        if snapshot.anchor_setup_active:
+            self._draw_anchor_setup(painter, snapshot, width, height)
+        elif calibration_visible:
+            self._anchor_image_rect = QRectF()
             self._draw_calibration_panel(painter, snapshot, width, height)
         else:
+            self._anchor_image_rect = QRectF()
             if snapshot.pedals_only:
                 self._draw_pedal_only_status(painter, width, height)
             else:
@@ -2402,6 +2753,98 @@ class OverlayWindow(QWidget):
                 f"LIGHT {snapshot.light_luma:0.0f} • "
                 f"DARK {snapshot.light_dark_fraction * 100.0:0.0f}%"
             ),
+        )
+
+    def _draw_anchor_setup(
+        self,
+        painter: QPainter,
+        snapshot: UiSnapshot,
+        width: float,
+        height: float,
+    ) -> None:
+        panel = QRectF(24.0, 142.0, max(420.0, width - 48.0), max(300.0, height - 210.0))
+        panel.setWidth(min(panel.width(), width - 48.0))
+        panel.setHeight(min(panel.height(), height - panel.top() - 62.0))
+        self._panel(painter, panel, opacity=235)
+        inner = panel.adjusted(22.0, 18.0, -22.0, -20.0)
+        instruction_height = 76.0
+        image_area = QRectF(
+            inner.left(),
+            inner.top() + instruction_height,
+            inner.width(),
+            max(120.0, inner.height() - instruction_height),
+        )
+        image = snapshot.preview
+        if image is None or image.width() <= 0 or image.height() <= 0:
+            self._anchor_image_rect = QRectF()
+            painter.setPen(QColor(245, 248, 252))
+            painter.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+            painter.drawText(image_area, Qt.AlignmentFlag.AlignCenter, "Waiting for camera frame")
+        else:
+            aspect = float(image.width()) / max(1.0, float(image.height()))
+            target_width = min(image_area.width(), image_area.height() * aspect)
+            target_height = target_width / aspect
+            if target_height > image_area.height():
+                target_height = image_area.height()
+                target_width = target_height * aspect
+            target = QRectF(
+                image_area.center().x() - target_width / 2.0,
+                image_area.center().y() - target_height / 2.0,
+                target_width,
+                target_height,
+            )
+            self._anchor_image_rect = target
+            painter.setPen(QPen(QColor(125, 155, 190), 2.0))
+            painter.setBrush(QColor(20, 28, 40))
+            painter.drawRoundedRect(target.adjusted(-3.0, -3.0, 3.0, 3.0), 9.0, 9.0)
+            painter.drawImage(target, image)
+
+            def display_point(index: int) -> Optional[QPointF]:
+                value = snapshot.anchor_setup_points.get(index)
+                if value is None:
+                    return None
+                x, y = value
+                if snapshot.preview_mirrored:
+                    x = 1.0 - x
+                return QPointF(target.left() + x * target.width(), target.top() + y * target.height())
+
+            for side, indices in MANUAL_FOOT_TRIANGLES.items():
+                color = QColor(80, 225, 135) if side == "right" else QColor(255, 105, 125)
+                heel, ankle, toe = indices
+                triangle = [display_point(heel), display_point(ankle), display_point(toe)]
+                painter.setPen(QPen(color, 3.0))
+                if triangle[0] is not None and triangle[1] is not None:
+                    painter.drawLine(triangle[0], triangle[1])
+                if triangle[1] is not None and triangle[2] is not None:
+                    painter.drawLine(triangle[1], triangle[2])
+                if triangle[2] is not None and triangle[0] is not None:
+                    painter.drawLine(triangle[2], triangle[0])
+                for point_index, point in zip(indices, triangle):
+                    if point is None:
+                        continue
+                    painter.setBrush(QColor(color.red(), color.green(), color.blue(), 80))
+                    painter.drawEllipse(point, 10.0, 10.0)
+                    if point_index in {LEFT_HEEL, RIGHT_HEEL}:
+                        painter.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+                        painter.drawText(
+                            QRectF(point.x() - 38.0, point.y() - 31.0, 76.0, 20.0),
+                            Qt.AlignmentFlag.AlignCenter,
+                            "PIVOT",
+                        )
+
+        painter.setPen(QColor(105, 215, 255))
+        painter.setFont(QFont("Segoe UI", 17, QFont.Weight.Bold))
+        painter.drawText(
+            QRectF(inner.left(), inner.top(), inner.width(), 34.0),
+            Qt.AlignmentFlag.AlignCenter,
+            snapshot.prompt,
+        )
+        painter.setPen(QColor(215, 225, 238))
+        painter.setFont(QFont("Segoe UI", 9, QFont.Weight.DemiBold))
+        painter.drawText(
+            QRectF(inner.left(), inner.top() + 37.0, inner.width(), 30.0),
+            Qt.AlignmentFlag.AlignCenter,
+            "Use the exact skin/shoe texture point • F7 clears all six points and restarts",
         )
 
     def _draw_generic_prompt(
@@ -2831,6 +3274,71 @@ class OverlayWindow(QWidget):
         )
 
 
+def preview_click_to_normalized(
+    x: float,
+    y: float,
+    image_rect: tuple[float, float, float, float],
+    mirrored: bool,
+) -> Optional[tuple[float, float]]:
+    left, top, width, height = (float(value) for value in image_rect)
+    if width <= 0.0 or height <= 0.0:
+        return None
+    u = (float(x) - left) / width
+    v = (float(y) - top) / height
+    if not (0.0 <= u <= 1.0 and 0.0 <= v <= 1.0):
+        return None
+    if mirrored:
+        u = 1.0 - u
+    return float(u), float(v)
+
+
+def validate_manual_anchor_points(
+    points: dict[int, np.ndarray],
+    frame_shape: tuple[int, ...],
+    minimum_separation_pixels: float,
+) -> Optional[str]:
+    if set(points) != set(MANUAL_FOOT_ANCHOR_INDICES):
+        return "all six heel, ankle, and toe points are required"
+    if len(frame_shape) < 2:
+        return "camera frame size is unavailable"
+    height, width = int(frame_shape[0]), int(frame_shape[1])
+    if width <= 1 or height <= 1:
+        return "camera frame size is invalid"
+    scale = np.array([width, height], dtype=np.float64)
+    minimum = max(2.0, float(minimum_separation_pixels))
+    for side, indices in MANUAL_FOOT_TRIANGLES.items():
+        values: list[np.ndarray] = []
+        for index in indices:
+            value = np.asarray(points.get(index), dtype=np.float64)
+            if value.shape != (2,) or not np.all(np.isfinite(value)):
+                return f"{side} anchor coordinates are invalid"
+            if not (0.0 <= value[0] <= 1.0 and 0.0 <= value[1] <= 1.0):
+                return f"{side} anchors must be inside the camera image"
+            values.append(value * scale)
+        for start, end in ((0, 1), (1, 2), (2, 0)):
+            if float(np.linalg.norm(values[end] - values[start])) < minimum:
+                return f"{side} anchor points are too close together"
+        twice_area = abs(
+            float(
+                (values[1][0] - values[0][0]) * (values[2][1] - values[0][1])
+                - (values[1][1] - values[0][1]) * (values[2][0] - values[0][0])
+            )
+        )
+        if twice_area < minimum * minimum:
+            return f"{side} heel, ankle, and toe must form a clear triangle"
+    left_centroid = np.mean(
+        [np.asarray(points[index], dtype=np.float64) * scale for index in MANUAL_FOOT_TRIANGLES["left"]],
+        axis=0,
+    )
+    right_centroid = np.mean(
+        [np.asarray(points[index], dtype=np.float64) * scale for index in MANUAL_FOOT_TRIANGLES["right"]],
+        axis=0,
+    )
+    if float(np.linalg.norm(left_centroid - right_centroid)) < minimum * 2.0:
+        return "left and right foot anchors overlap"
+    return None
+
+
 def clip(value: float, minimum: float, maximum: float) -> float:
     return max(minimum, min(maximum, float(value)))
 
@@ -2939,6 +3447,57 @@ def feature_signal_to_noise(
         return float(np.linalg.norm(normalized))
     weight_array = np.clip(np.asarray(weights, dtype=np.float64), 0.0, 1.0)
     return float(np.sqrt(np.sum(weight_array * np.square(normalized))))
+
+
+def project_heel_hinge(
+    current: FootFeatureObservation,
+    neutral: np.ndarray,
+    pressed: np.ndarray,
+    minimum_tilt_degrees: float = 2.0,
+    extension_weight: float = 0.15,
+) -> Optional[float]:
+    """Map only the calibrated heel-to-toe tilt and optional radial extension."""
+
+    values = np.asarray(current.values, dtype=np.float64)
+    neutral = np.asarray(neutral, dtype=np.float64)
+    pressed = np.asarray(pressed, dtype=np.float64)
+    validity = np.asarray(current.validity, dtype=np.float64)
+    if (
+        values.shape != (FOOT_FEATURE_DIMENSION,)
+        or neutral.shape != values.shape
+        or pressed.shape != values.shape
+        or validity.shape != values.shape
+        or not np.all(np.isfinite(values))
+        or float(np.min(validity)) < 0.05
+    ):
+        return None
+
+    neutral_angle = math.atan2(float(neutral[0]), float(neutral[1]))
+    pressed_angle = math.atan2(float(pressed[0]), float(pressed[1]))
+    current_angle = math.atan2(float(values[0]), float(values[1]))
+    calibrated_tilt = wrap_angle(pressed_angle - neutral_angle)
+    minimum_tilt = math.radians(max(0.1, float(minimum_tilt_degrees)))
+    if abs(calibrated_tilt) < minimum_tilt:
+        return None
+
+    current_tilt = wrap_angle(current_angle - neutral_angle)
+    if current_tilt * calibrated_tilt <= 0.0:
+        return 0.0
+    tilt_fraction = max(0.0, current_tilt / calibrated_tilt)
+
+    weight = clip(extension_weight, 0.0, 0.45)
+    calibrated_extension = float(pressed[2] - neutral[2])
+    current_extension = float(values[2] - neutral[2])
+    if (
+        abs(calibrated_extension) < 0.002
+        or current_extension * calibrated_extension <= 0.0
+    ):
+        weight = 0.0
+        extension_fraction = tilt_fraction
+    else:
+        extension_fraction = max(0.0, current_extension / calibrated_extension)
+    value = (1.0 - weight) * tilt_fraction + weight * extension_fraction
+    return clip(value, 0.0, 1.0)
 
 
 def project_pedal(
@@ -3256,6 +3815,11 @@ class PoseFeatureTracker:
         self.leg_bone_length_tolerance = clip(
             float(config.get("leg_lock_bone_length_tolerance", 0.34)), 0.10, 0.80
         )
+        self.manual_triangle_max_edge_change = clip(
+            float(config.get("manual_triangle_max_edge_change_ratio", 0.22)),
+            0.03,
+            0.80,
+        )
         self.leg_reacquire_anchors = max(
             1, int(config.get("leg_lock_reacquire_anchors", 3))
         )
@@ -3278,6 +3842,14 @@ class PoseFeatureTracker:
             self.patch_grid_size * self.patch_grid_size,
             max(1, int(config["optical_flow_min_patch_votes"])),
         )
+        manual_patch_grid = max(3, int(config.get("manual_anchor_patch_grid_size", 5)))
+        self.manual_patch_grid_size = (
+            manual_patch_grid if manual_patch_grid % 2 == 1 else manual_patch_grid + 1
+        )
+        self.manual_min_patch_votes = min(
+            self.manual_patch_grid_size * self.manual_patch_grid_size,
+            max(3, int(config.get("manual_anchor_min_patch_votes", 9))),
+        )
         window = max(9, int(config["optical_flow_window_pixels"]))
         self.flow_window = window if window % 2 == 1 else window + 1
         self.flow_max_level = max(0, int(config["optical_flow_max_level"]))
@@ -3297,6 +3869,30 @@ class PoseFeatureTracker:
 
         self.prev_gray: Optional[np.ndarray] = None
         self.points: dict[int, np.ndarray] = {}
+        self.manual_anchor_points: dict[int, np.ndarray] = {}
+        self.manual_anchor_indices: set[int] = set()
+        self.manual_anchor_tracking_lost = False
+        self.manual_reference_points: dict[int, np.ndarray] = {}
+        self.manual_anchor_templates: dict[int, tuple[np.ndarray, ...]] = {}
+        self.manual_match_quality: dict[int, float] = {}
+        template_size = max(
+            9,
+            int(config.get("manual_anchor_template_size_pixels", 17)),
+        )
+        self.manual_template_size = template_size if template_size % 2 == 1 else template_size + 1
+        self.manual_template_search = max(
+            2,
+            int(config.get("manual_anchor_template_search_pixels", 7)),
+        )
+        self.manual_template_min_score = clip(
+            float(config.get("manual_anchor_template_min_score", 0.38)),
+            0.10,
+            0.95,
+        )
+        self.manual_template_rotation = max(
+            0.0,
+            float(config.get("manual_anchor_template_rotation_degrees", 14.0)),
+        )
         self.point_quality: dict[int, float] = {}
         self.last_ai_anchor: dict[int, float] = {}
         self.last_ai_quality: dict[int, float] = {}
@@ -3318,8 +3914,16 @@ class PoseFeatureTracker:
         self.last_steering_time = 0.0
 
     def reset(self) -> None:
+        preserved_manual = {
+            index: np.asarray(self.points.get(index, point), dtype=np.float64).copy()
+            for index, point in self.manual_anchor_points.items()
+        }
         self.prev_gray = None
         self.points.clear()
+        self.points.update(preserved_manual)
+        self.manual_anchor_points = {
+            index: point.copy() for index, point in preserved_manual.items()
+        }
         self.point_quality.clear()
         self.last_ai_anchor.clear()
         self.last_ai_quality.clear()
@@ -3330,6 +3934,7 @@ class PoseFeatureTracker:
         self._anchor_foot_swapped = False
         self._anchor_point_support.clear()
         self.anchor_mismatch_counts.clear()
+        self.manual_match_quality.clear()
         self.person_mask = None
         self.person_mask_updated_at = 0.0
         self.last_leg_affine_quality = {"left": 0.0, "right": 0.0}
@@ -3344,6 +3949,231 @@ class PoseFeatureTracker:
         self.last_right_time = 0.0
         self.last_steering_time = 0.0
 
+    @property
+    def manual_anchors_complete(self) -> bool:
+        return (
+            self.manual_anchor_indices == set(MANUAL_FOOT_ANCHOR_INDICES)
+            and not self.manual_anchor_tracking_lost
+        )
+
+    def set_manual_foot_anchors(
+        self,
+        points: dict[int, np.ndarray],
+        *,
+        reference_gray: Optional[np.ndarray] = None,
+        reference_points: Optional[dict[int, np.ndarray]] = None,
+    ) -> None:
+        if set(points) != set(MANUAL_FOOT_ANCHOR_INDICES):
+            raise ValueError("Manual foot anchors must contain heel, ankle, and toe for both feet")
+        normalized: dict[int, np.ndarray] = {}
+        for index, point in points.items():
+            value = np.asarray(point, dtype=np.float64)
+            if value.shape != (2,) or not np.all(np.isfinite(value)):
+                raise ValueError("Manual foot anchor coordinates must be finite 2-D points")
+            if not (-0.02 <= value[0] <= 1.02 and -0.02 <= value[1] <= 1.02):
+                raise ValueError("Manual foot anchor coordinates must lie inside the camera frame")
+            normalized[index] = value.copy()
+        reference_source = reference_points if reference_points is not None else normalized
+        reference_normalized: dict[int, np.ndarray] = {}
+        for index in MANUAL_FOOT_ANCHOR_INDICES:
+            value = np.asarray(reference_source[index], dtype=np.float64)
+            if value.shape != (2,) or not np.all(np.isfinite(value)):
+                raise ValueError("Manual reference coordinates must be finite 2-D points")
+            reference_normalized[index] = value.copy()
+        templates: dict[int, tuple[np.ndarray, ...]] = {}
+        if reference_gray is not None:
+            templates = self._build_manual_anchor_templates(
+                reference_gray,
+                reference_normalized,
+            )
+        self.manual_anchor_points = normalized
+        self.manual_anchor_indices = set(normalized)
+        self.manual_anchor_tracking_lost = False
+        self.manual_reference_points = reference_normalized
+        self.manual_anchor_templates = templates
+        self.manual_match_quality = {}
+        for index in MANUAL_FOOT_ANCHOR_INDICES:
+            self.points.pop(index, None)
+        self.points.update({index: point.copy() for index, point in normalized.items()})
+        self.prev_gray = None
+        self.left_filter.reset()
+        self.right_filter.reset()
+        self.last_left_feature = None
+        self.last_right_feature = None
+
+    def clear_manual_foot_anchors(self) -> None:
+        for index in self.manual_anchor_indices:
+            self.points.pop(index, None)
+        self.manual_anchor_points = {}
+        self.manual_anchor_indices = set()
+        self.manual_anchor_tracking_lost = False
+        self.manual_reference_points = {}
+        self.manual_anchor_templates = {}
+        self.manual_match_quality = {}
+        self.prev_gray = None
+        self.last_left_feature = None
+        self.last_right_feature = None
+
+    @staticmethod
+    def _centered_gray_patch(
+        gray: np.ndarray,
+        centre_pixels: np.ndarray,
+        size: int,
+    ) -> np.ndarray:
+        size = max(3, int(size))
+        if size % 2 == 0:
+            size += 1
+        if gray.ndim != 2 or gray.size == 0:
+            raise ValueError("anchor reference image is invalid")
+        padding = size // 2 + 2
+        padded = cv2.copyMakeBorder(
+            np.ascontiguousarray(gray),
+            padding,
+            padding,
+            padding,
+            padding,
+            cv2.BORDER_REFLECT_101,
+        )
+        centre = (
+            float(centre_pixels[0]) + padding,
+            float(centre_pixels[1]) + padding,
+        )
+        return np.ascontiguousarray(cv2.getRectSubPix(padded, (size, size), centre))
+
+    def _build_manual_anchor_templates(
+        self,
+        reference_gray: np.ndarray,
+        reference_points: dict[int, np.ndarray],
+    ) -> dict[int, tuple[np.ndarray, ...]]:
+        gray = np.ascontiguousarray(reference_gray)
+        if gray.ndim != 2 or min(gray.shape[:2]) <= 1:
+            raise ValueError("the frozen anchor image is invalid")
+        height, width = gray.shape[:2]
+        scale = np.array([width, height], dtype=np.float64)
+        labels = dict(MANUAL_ANCHOR_SEQUENCE)
+        output: dict[int, tuple[np.ndarray, ...]] = {}
+        angles = [0.0]
+        if self.manual_template_rotation >= 0.5:
+            angles = [
+                0.0,
+                -self.manual_template_rotation,
+                self.manual_template_rotation,
+            ]
+        for index in MANUAL_FOOT_ANCHOR_INDICES:
+            point = np.asarray(reference_points[index], dtype=np.float64)
+            base = self._centered_gray_patch(
+                gray,
+                point * scale,
+                self.manual_template_size,
+            )
+            if float(np.std(base.astype(np.float32))) < 2.0:
+                label = labels.get(index, "selected point").lower()
+                raise ValueError(f"{label} has too little visible texture")
+            centre = (self.manual_template_size - 1) / 2.0
+            variants: list[np.ndarray] = []
+            for angle in angles:
+                if abs(angle) < 1e-6:
+                    variant = base.copy()
+                else:
+                    matrix = cv2.getRotationMatrix2D((centre, centre), angle, 1.0)
+                    variant = cv2.warpAffine(
+                        base,
+                        matrix,
+                        (self.manual_template_size, self.manual_template_size),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_REFLECT_101,
+                    )
+                variants.append(np.ascontiguousarray(variant))
+            output[index] = tuple(variants)
+        return output
+
+    def _validate_manual_template_flow(
+        self,
+        gray: np.ndarray,
+        candidates: dict[int, np.ndarray],
+    ) -> dict[int, np.ndarray]:
+        """Reattach LK predictions to the original clicked texture every frame."""
+
+        self.manual_match_quality = {}
+        if not candidates or not self.manual_anchor_templates:
+            self.manual_match_quality = {index: 1.0 for index in candidates}
+            return candidates
+        height, width = gray.shape[:2]
+        scale = np.array([width, height], dtype=np.float64)
+        output: dict[int, np.ndarray] = {}
+        search = self.manual_template_search
+        search_size = self.manual_template_size + 2 * search
+        for index, candidate in candidates.items():
+            templates = self.manual_anchor_templates.get(index)
+            if not templates:
+                output[index] = np.asarray(candidate, dtype=np.float64).copy()
+                self.manual_match_quality[index] = 1.0
+                continue
+            candidate_pixels = np.asarray(candidate, dtype=np.float64) * scale
+            try:
+                search_patch = self._centered_gray_patch(
+                    gray,
+                    candidate_pixels,
+                    search_size,
+                )
+            except (ValueError, cv2.error):
+                continue
+            best_score = -1.0
+            best_location = (search, search)
+            for variant_index, template in enumerate(templates):
+                try:
+                    response = cv2.matchTemplate(
+                        search_patch,
+                        template,
+                        cv2.TM_CCOEFF_NORMED,
+                    )
+                except cv2.error:
+                    continue
+                _minimum, maximum, _min_location, max_location = cv2.minMaxLoc(response)
+                if math.isfinite(maximum) and maximum > best_score:
+                    best_score = float(maximum)
+                    best_location = max_location
+                # The unrotated canonical template is checked first and is the
+                # common steady-foot case. Only pay for rotated variants when
+                # tilt has lowered its match below the acceptance threshold.
+                if (
+                    variant_index == 0
+                    and best_score >= min(0.95, self.manual_template_min_score + 0.08)
+                ):
+                    break
+            if best_score < self.manual_template_min_score:
+                continue
+            corrected_pixels = candidate_pixels + np.array(
+                [best_location[0] - search, best_location[1] - search],
+                dtype=np.float64,
+            )
+            corrected = corrected_pixels / scale
+            if not (-0.08 <= corrected[0] <= 1.08 and -0.08 <= corrected[1] <= 1.08):
+                continue
+            output[index] = corrected
+            self.manual_match_quality[index] = clip(best_score, 0.0, 1.0)
+        return output
+
+    def align_manual_anchor_selection(
+        self,
+        reference_gray: np.ndarray,
+        current_gray: np.ndarray,
+        points: dict[int, np.ndarray],
+    ) -> dict[int, np.ndarray]:
+        """Carry all six clicks from the frozen setup frame to the live frame."""
+
+        if set(points) != set(MANUAL_FOOT_ANCHOR_INDICES):
+            return {}
+        return self._track_point_clouds(
+            np.ascontiguousarray(reference_gray),
+            np.ascontiguousarray(current_gray),
+            points,
+            validate_backward=True,
+            long_range=True,
+            patch_grid_size=self.manual_patch_grid_size,
+            minimum_votes=self.manual_min_patch_votes,
+        )
+
     def update(
         self,
         frame: np.ndarray,
@@ -3353,6 +4183,7 @@ class PoseFeatureTracker:
         sequence: int = -1,
     ) -> PoseFeatures:
         features = PoseFeatures()
+        features.hard_locked_indices = frozenset(self.manual_anchor_indices)
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         flow_points = self._calculate_optical_flow(gray)
 
@@ -3390,6 +4221,12 @@ class PoseFeatureTracker:
         )
         self.points = merged
         self.point_quality = point_quality
+        if (
+            self.prev_gray is not None
+            and self.manual_anchor_indices
+            and not self.manual_anchor_indices.issubset(merged)
+        ):
+            self.manual_anchor_tracking_lost = True
         features.tracked_landmarks = {
             index: (float(point[0]), float(point[1]), float(sources[index]))
             for index, point in merged.items()
@@ -3459,12 +4296,13 @@ class PoseFeatureTracker:
         self.prev_gray = gray
         return features
 
-    def _patch_offsets(self) -> np.ndarray:
+    def _patch_offsets(self, grid_size: Optional[int] = None) -> np.ndarray:
         radius = self.patch_radius
-        if self.patch_grid_size <= 1:
+        size = self.patch_grid_size if grid_size is None else max(1, int(grid_size))
+        if size <= 1:
             return np.zeros((1, 2), dtype=np.float32)
         coordinates = np.linspace(
-            -radius, radius, self.patch_grid_size, dtype=np.float32
+            -radius, radius, size, dtype=np.float32
         )
         return np.array(
             [(x, y) for y in coordinates for x in coordinates], dtype=np.float32
@@ -3478,6 +4316,8 @@ class PoseFeatureTracker:
         *,
         validate_backward: bool = False,
         long_range: bool = False,
+        patch_grid_size: Optional[int] = None,
+        minimum_votes: Optional[int] = None,
     ) -> dict[int, np.ndarray]:
         """Track a small texture grid around every semantic landmark.
 
@@ -3502,7 +4342,11 @@ class PoseFeatureTracker:
         centre_pixels = centre_normalized * np.array(
             [previous_width, previous_height], dtype=np.float64
         )
-        offsets = self._patch_offsets().astype(np.float64, copy=False)
+        offsets = self._patch_offsets(patch_grid_size).astype(np.float64, copy=False)
+        required_votes = self.min_patch_votes if minimum_votes is None else max(
+            1, int(minimum_votes)
+        )
+        required_votes = min(required_votes, len(offsets))
         window = max(self.flow_window, 19) if long_range else self.flow_window
         max_level = max(self.flow_max_level, 2) if long_range else self.flow_max_level
 
@@ -3639,7 +4483,7 @@ class PoseFeatureTracker:
         refined_motion = (
             displacements * refined_weights[..., None]
         ).sum(axis=1) / refined_safe[:, None]
-        use_refined = refined_counts >= self.min_patch_votes
+        use_refined = refined_counts >= required_votes
         motion[use_refined] = refined_motion[use_refined]
         counts[use_refined] = refined_counts[use_refined]
 
@@ -3649,7 +4493,7 @@ class PoseFeatureTracker:
         )
         output: dict[int, np.ndarray] = {}
         for position, index in enumerate(keys):
-            if counts[position] < self.min_patch_votes:
+            if counts[position] < required_votes:
                 continue
             x, y = normalized[position]
             if -0.08 <= x <= 1.08 and -0.08 <= y <= 1.08:
@@ -3661,13 +4505,35 @@ class PoseFeatureTracker:
             return {}
         self.flow_frame_counter += 1
         validate = self.flow_frame_counter % self.flow_validation_interval == 0
+        automatic_centres = {
+            index: point
+            for index, point in self.points.items()
+            if index not in self.manual_anchor_indices
+        }
         individual = self._track_point_clouds(
             self.prev_gray,
             gray,
-            self.points,
+            automatic_centres,
             validate_backward=validate,
             long_range=False,
         )
+        manual_centres = {
+            index: self.points[index]
+            for index in self.manual_anchor_indices
+            if index in self.points
+        }
+        manual_flow = self._track_point_clouds(
+            self.prev_gray,
+            gray,
+            manual_centres,
+            validate_backward=True,
+            long_range=False,
+            patch_grid_size=self.manual_patch_grid_size,
+            minimum_votes=self.manual_min_patch_votes,
+        )
+        manual_flow = self._validate_manual_template_flow(gray, manual_flow)
+        manual_flow = self._validate_manual_triangle_flow(manual_flow, gray.shape)
+        individual.update(manual_flow)
         if not self.leg_lock_enabled:
             return individual
 
@@ -3682,11 +4548,101 @@ class PoseFeatureTracker:
             coherent.update(predicted)
             qualities[side] = quality
         self.last_leg_affine_quality = qualities
-        return self._combine_leg_flow(
+        combined = self._combine_leg_flow(
             individual=individual,
             coherent=coherent,
             frame_shape=gray.shape,
         )
+        # Confirmed manual points are owned solely by strict local patch flow.
+        # Coherent leg motion and MediaPipe may never flatten or replace them.
+        for index in self.manual_anchor_indices:
+            if index in manual_flow:
+                combined[index] = manual_flow[index].copy()
+            else:
+                combined.pop(index, None)
+        return combined
+
+    def _validate_manual_triangle_flow(
+        self,
+        candidates: dict[int, np.ndarray],
+        frame_shape: tuple[int, ...],
+    ) -> dict[int, np.ndarray]:
+        if not self.manual_anchor_indices:
+            return candidates
+        height, width = frame_shape[:2]
+        scale = np.array([width, height], dtype=np.float64)
+        output = candidates.copy()
+        for indices in MANUAL_FOOT_TRIANGLES.values():
+            if not all(index in self.manual_anchor_indices for index in indices):
+                continue
+            # Losing one vertex makes the complete pedal triangle unavailable;
+            # never infer or freeze the missing point.
+            if not all(index in candidates and index in self.points for index in indices):
+                for index in indices:
+                    output.pop(index, None)
+                continue
+            previous = [self.points[index] * scale for index in indices]
+            reference_source = (
+                self.manual_reference_points
+                if all(index in self.manual_reference_points for index in indices)
+                else self.points
+            )
+            reference = [reference_source[index] * scale for index in indices]
+            current = [candidates[index] * scale for index in indices]
+            edge_pairs = ((0, 1), (1, 2), (2, 0))
+            coherent = True
+            for start, end in edge_pairs:
+                old_length = float(np.linalg.norm(previous[end] - previous[start]))
+                new_length = float(np.linalg.norm(current[end] - current[start]))
+                if old_length < 2.0 or new_length < 2.0:
+                    coherent = False
+                    break
+                if abs(new_length / old_length - 1.0) > self.manual_triangle_max_edge_change:
+                    coherent = False
+                    break
+                reference_length = float(
+                    np.linalg.norm(reference[end] - reference[start])
+                )
+                if (
+                    reference_length < 2.0
+                    or abs(new_length / reference_length - 1.0)
+                    > self.manual_triangle_max_edge_change
+                ):
+                    coherent = False
+                    break
+            previous_cross = float(
+                (previous[1][0] - previous[0][0])
+                * (previous[2][1] - previous[0][1])
+                - (previous[1][1] - previous[0][1])
+                * (previous[2][0] - previous[0][0])
+            )
+            current_cross = float(
+                (current[1][0] - current[0][0])
+                * (current[2][1] - current[0][1])
+                - (current[1][1] - current[0][1])
+                * (current[2][0] - current[0][0])
+            )
+            reference_cross = float(
+                (reference[1][0] - reference[0][0])
+                * (reference[2][1] - reference[0][1])
+                - (reference[1][1] - reference[0][1])
+                * (reference[2][0] - reference[0][0])
+            )
+            # Reflection preserves all three edge lengths, so the signed area
+            # is an independent guard against a toe/ankle swap or a patch that
+            # jumps across the heel-pivot axis.
+            if (
+                abs(previous_cross) < 1.0
+                or abs(current_cross) < 1.0
+                or abs(reference_cross) < 1.0
+                or previous_cross * current_cross <= 0.0
+                or reference_cross * current_cross <= 0.0
+            ):
+                coherent = False
+            if not coherent:
+                for index in indices:
+                    output.pop(index, None)
+        return output
 
     def _leg_geometry_mask(
         self,
@@ -4287,6 +5243,24 @@ class PoseFeatureTracker:
                 clip(confidence, 0.0, 1.0) * clip(support_for_quality, 0.0, 1.0)
             )
             flow_point = flow_points.get(index)
+            if index in self.manual_anchor_indices:
+                if flow_point is not None:
+                    manual_quality = clip(
+                        float(self.manual_match_quality.get(index, 1.0)),
+                        0.0,
+                        1.0,
+                    )
+                    merged[index] = np.asarray(flow_point, dtype=np.float64).copy()
+                    sources[index] = manual_quality
+                    quality[index] = manual_quality
+                elif self.prev_gray is None and index in self.points:
+                    # Seed the selected point onto the first frame after setup
+                    # or calibration reset. Every later frame requires verified
+                    # forward/backward local flow.
+                    merged[index] = np.asarray(self.points[index], dtype=np.float64).copy()
+                    sources[index] = 1.0
+                    quality[index] = 1.0
+                continue
             ai_is_strong = (
                 ai_point is not None
                 and confidence >= self.confidence_threshold
@@ -4426,6 +5400,20 @@ class PoseFeatureTracker:
             last_feature = self.last_right_feature
             last_time = self.last_right_time
 
+        manual_indices = set(MANUAL_FOOT_TRIANGLES[side])
+        manual_side_is_locked = manual_indices.issubset(self.manual_anchor_indices)
+        if manual_side_is_locked and raw is None:
+            # A hard-locked triangle is atomic. Never bridge a missing heel,
+            # ankle, toe, or invalid triangle with the generic short feature
+            # hold: that would keep sending stale pressure after the user's
+            # selected geometry was lost.
+            filter_object.reset()
+            if side == "left":
+                self.last_left_feature = None
+            else:
+                self.last_right_feature = None
+            return None, False, False
+
         core_threshold = clip(
             float(self.config.get("foot_core_min_confidence", 0.24)), 0.05, 1.0
         )
@@ -4466,8 +5454,8 @@ class PoseFeatureTracker:
         return None, False, False
 
 
-FOOT_FEATURE_DIMENSION = 15
-FOOT_WORLD_FEATURE_START = 12
+FOOT_FEATURE_DIMENSION = 3
+FOOT_WORLD_FEATURE_START = FOOT_FEATURE_DIMENSION
 
 
 def shin_local_components(
@@ -4494,28 +5482,17 @@ def build_foot_feature(
     qualities: Optional[dict[int, float]] = None,
     frame_aspect_ratio: float = 1.0,
 ) -> Optional[FootFeatureObservation]:
-    """Build shin-local foot articulation that survives camera/body rotation.
+    """Build the strict heel-pivot triangle used for pedal output.
 
-    Knee, ankle, and toe are the stable core. Heel, hip, and world cues are
-    optional and carry explicit zero validity when absent, so a dropout can
-    never masquerade as a real zero-valued movement.
+    Only heel, ankle, and toe/forefoot enter the feature. Hip, knee, bedding,
+    MediaPipe world points, and the remainder of the leg cannot change pedal
+    demand. The heel is the translation-cancelling pivot; the ankle supplies a
+    scale reference; and the heel-to-toe ray supplies pedal tilt.
     """
     if side == "left":
-        hip_index, knee_index, ankle_index, heel_index, toe_index = (
-            LEFT_HIP,
-            LEFT_KNEE,
-            LEFT_ANKLE,
-            LEFT_HEEL,
-            LEFT_FOOT_INDEX,
-        )
+        ankle_index, heel_index, toe_index = LEFT_ANKLE, LEFT_HEEL, LEFT_FOOT_INDEX
     elif side == "right":
-        hip_index, knee_index, ankle_index, heel_index, toe_index = (
-            RIGHT_HIP,
-            RIGHT_KNEE,
-            RIGHT_ANKLE,
-            RIGHT_HEEL,
-            RIGHT_FOOT_INDEX,
-        )
+        ankle_index, heel_index, toe_index = RIGHT_ANKLE, RIGHT_HEEL, RIGHT_FOOT_INDEX
     else:
         raise ValueError("side must be 'left' or 'right'")
 
@@ -4531,18 +5508,10 @@ def build_foot_feature(
         value[0] *= aspect
         return value[:2]
 
-    hip = metric_point(hip_index)
-    knee = metric_point(knee_index)
     ankle = metric_point(ankle_index)
     heel = metric_point(heel_index)
     toe = metric_point(toe_index)
-    if knee is None or ankle is None or toe is None:
-        return None
-
-    shin_vector = np.asarray(ankle, dtype=np.float64) - np.asarray(knee, dtype=np.float64)
-    shin_length = float(np.linalg.norm(shin_vector))
-    shin_unit = unit_vector(shin_vector)
-    if shin_unit is None or shin_length < 0.015:
+    if heel is None or ankle is None or toe is None:
         return None
 
     def quality(*indices: int) -> float:
@@ -4554,74 +5523,28 @@ def build_foot_feature(
             1.0,
         )
 
-    values = np.zeros(FOOT_FEATURE_DIMENSION, dtype=np.float64)
-    validity = np.zeros(FOOT_FEATURE_DIMENSION, dtype=np.float64)
-    core_quality = quality(knee_index, ankle_index, toe_index)
-    toe_vector = np.asarray(toe, dtype=np.float64) - np.asarray(ankle, dtype=np.float64)
-    toe_unit = unit_vector(toe_vector)
-    if toe_unit is None:
+    pivot_to_toe = np.asarray(toe, dtype=np.float64) - np.asarray(heel, dtype=np.float64)
+    pivot_to_ankle = np.asarray(ankle, dtype=np.float64) - np.asarray(heel, dtype=np.float64)
+    ankle_to_toe = np.asarray(toe, dtype=np.float64) - np.asarray(ankle, dtype=np.float64)
+    sole_length = float(np.linalg.norm(pivot_to_toe))
+    reference_length = float(np.linalg.norm(pivot_to_ankle))
+    third_edge = float(np.linalg.norm(ankle_to_toe))
+    if min(sole_length, reference_length, third_edge) < 0.008:
         return None
-    toe_length_ratio = float(np.linalg.norm(toe_vector)) / shin_length
-    if not 0.02 <= toe_length_ratio <= 1.50:
+    ratio = sole_length / reference_length
+    if not 0.05 <= ratio <= 8.0:
         return None
-    values[0:2] = np.clip(
-        shin_local_components(toe_vector, shin_unit, shin_length), -3.0, 3.0
+    angle = math.atan2(float(pivot_to_toe[1]), float(pivot_to_toe[0]))
+    values = np.array(
+        [math.sin(angle), math.cos(angle), clip(math.log(ratio), -3.0, 3.0)],
+        dtype=np.float64,
     )
-    values[2:4] = shin_local_components(toe_unit, shin_unit, 1.0)
-    values[4] = toe_length_ratio
-    validity[0:5] = core_quality
-
-    if heel is not None:
-        heel_vector = np.asarray(heel, dtype=np.float64) - np.asarray(ankle, dtype=np.float64)
-        sole_vector = np.asarray(toe, dtype=np.float64) - np.asarray(heel, dtype=np.float64)
-        sole_unit = unit_vector(sole_vector)
-        heel_length_ratio = float(np.linalg.norm(heel_vector)) / shin_length
-        sole_length_ratio = float(np.linalg.norm(sole_vector)) / shin_length
-        # A blanket point can be finite and confident yet geometrically
-        # impossible. Treat implausible heel geometry exactly like a missing
-        # heel so the stable knee/ankle/toe core continues to drive the pedal.
-        heel_plausible = (
-            0.015 <= heel_length_ratio <= 0.80
-            and 0.04 <= sole_length_ratio <= 1.50
-        )
-        if sole_unit is not None and heel_plausible:
-            heel_quality = quality(knee_index, ankle_index, heel_index, toe_index)
-            values[5:7] = np.clip(
-                shin_local_components(heel_vector, shin_unit, shin_length), -3.0, 3.0
-            )
-            values[7:9] = shin_local_components(sole_unit, shin_unit, 1.0)
-            values[9] = sole_length_ratio
-            validity[5:10] = heel_quality
-
-    if hip is not None:
-        thigh_vector = np.asarray(knee, dtype=np.float64) - np.asarray(hip, dtype=np.float64)
-        thigh_unit = unit_vector(thigh_vector)
-        thigh_ratio = float(np.linalg.norm(thigh_vector)) / shin_length
-        if thigh_unit is not None and 0.30 <= thigh_ratio <= 3.00:
-            values[10:12] = shin_local_components(thigh_unit, shin_unit, 1.0)
-            validity[10:12] = quality(hip_index, knee_index, ankle_index)
-
-    world_toe = world_points.get(toe_index)
-    world_knee = world_points.get(knee_index)
-    world_ankle = world_points.get(ankle_index)
-    if world_toe is not None and world_knee is not None and world_ankle is not None:
-        world_shin = np.asarray(world_ankle) - np.asarray(world_knee)
-        world_foot = np.asarray(world_toe) - np.asarray(world_ankle)
-        world_shin_length = float(np.linalg.norm(world_shin))
-        world_shin_unit = unit_vector(world_shin)
-        world_foot_unit = unit_vector(world_foot)
-        if (
-            world_shin_unit is not None
-            and world_foot_unit is not None
-            and world_shin_length >= 1e-4
-        ):
-            values[12] = clip(float(np.dot(world_shin_unit, world_foot_unit)), -1.0, 1.0)
-            values[13] = clip(float(np.linalg.norm(np.cross(world_shin_unit, world_foot_unit))), 0.0, 1.0)
-            values[14] = clip(float(np.linalg.norm(world_foot)) / world_shin_length, 0.0, 3.0)
-            validity[12:15] = core_quality
+    core_quality = quality(heel_index, ankle_index, toe_index)
+    validity = np.full(FOOT_FEATURE_DIMENSION, core_quality, dtype=np.float64)
 
     if not np.all(np.isfinite(values)) or not np.all(np.isfinite(validity)):
         return None
+    _ = world_points  # Kept in the signature for third-party compatibility.
     return FootFeatureObservation(values=values, validity=validity, confidence=core_quality)
 
 
@@ -4797,6 +5720,40 @@ def make_preview_qimage(frame: np.ndarray, features: PoseFeatures, config: dict[
         centre = (int(x * preview_width), int(y * preview_height))
         thickness = 2 if source_strength >= 0.9 else 1
         cv2.circle(preview, centre, 7, (255, 210, 80), thickness, cv2.LINE_AA)
+
+    # Confirmed manual anchors are deliberately visually distinct from AI
+    # landmarks. These are the only points allowed to drive pedal output.
+    hard_locked = set(features.hard_locked_indices)
+    for side, indices in MANUAL_FOOT_TRIANGLES.items():
+        if not set(indices).issubset(hard_locked):
+            continue
+        points: list[tuple[int, int]] = []
+        for index in indices:
+            tracked = features.tracked_landmarks.get(index)
+            if tracked is None:
+                points = []
+                break
+            points.append(
+                (int(tracked[0] * preview_width), int(tracked[1] * preview_height))
+            )
+        if len(points) != 3:
+            continue
+        color = (90, 255, 130) if side == "right" else (120, 90, 255)
+        cv2.line(preview, points[0], points[1], color, 3, cv2.LINE_AA)
+        cv2.line(preview, points[1], points[2], color, 3, cv2.LINE_AA)
+        cv2.line(preview, points[2], points[0], color, 3, cv2.LINE_AA)
+        for point in points:
+            cv2.circle(preview, point, 9, color, 3, cv2.LINE_AA)
+        cv2.putText(
+            preview,
+            "PIVOT",
+            (points[0][0] + 8, points[0][1] - 8),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
 
     if bool(config["mirror_preview"]):
         preview = cv2.flip(preview, 1)
@@ -5000,48 +5957,49 @@ def load_config(path: Path) -> dict[str, Any]:
                     }
                 )
 
-        if loaded_version < 6:
-            # Only replace values that are still exactly the v0.5 defaults.
-            # Deliberate user tuning survives, while the old near-binary curve
-            # migrates to the finer endpoint-preserving v0.6 response.
-            v5_to_v6_defaults: dict[str, tuple[Any, Any]] = {
-                "optical_flow_min_patch_votes": (3, 4),
-                "pedal_raw_feature_blend": (0.97, 0.90),
-                "pedal_sensitivity": (2.20, 1.0),
-                "pedal_curve_exponent": (0.44, 1.0),
-                "throttle_sensitivity": (3.40, 1.0),
-                "brake_sensitivity": (2.25, 1.0),
-                "throttle_deadzone": (0.0015, 0.004),
-                "throttle_curve_exponent": (0.27, 1.0),
-                "brake_curve_exponent": (0.44, 1.0),
-                "throttle_initial_response": (0.05, 0.0),
-                "pedal_prediction_max_advance": (0.10, 0.035),
-            }
-            if loaded_version >= 4:
-                for key, (old_default, new_default) in v5_to_v6_defaults.items():
-                    current = config.get(key, old_default)
-                    same = (
-                        math.isclose(
-                            float(current),
-                            float(old_default),
-                            rel_tol=0.0,
-                            abs_tol=1e-9,
+        if loaded_version < 7:
+            if loaded_version < 6:
+                # Replace only values still exactly equal to the v0.5 defaults.
+                # Deliberate tuning survives the v0.6 response migration.
+                v5_to_v6_defaults: dict[str, tuple[Any, Any]] = {
+                    "optical_flow_min_patch_votes": (3, 4),
+                    "pedal_raw_feature_blend": (0.97, 0.90),
+                    "pedal_sensitivity": (2.20, 1.0),
+                    "pedal_curve_exponent": (0.44, 1.0),
+                    "throttle_sensitivity": (3.40, 1.0),
+                    "brake_sensitivity": (2.25, 1.0),
+                    "throttle_deadzone": (0.0015, 0.004),
+                    "throttle_curve_exponent": (0.27, 1.0),
+                    "brake_curve_exponent": (0.44, 1.0),
+                    "throttle_initial_response": (0.05, 0.0),
+                    "pedal_prediction_max_advance": (0.10, 0.035),
+                }
+                if loaded_version >= 4:
+                    for key, (old_default, new_default) in v5_to_v6_defaults.items():
+                        current = config.get(key, old_default)
+                        same = (
+                            math.isclose(
+                                float(current),
+                                float(old_default),
+                                rel_tol=0.0,
+                                abs_tol=1e-9,
+                            )
+                            if isinstance(old_default, (int, float))
+                            else current == old_default
                         )
-                        if isinstance(old_default, (int, float))
-                        else current == old_default
-                    )
-                    if same:
-                        config[key] = new_default
-            config["config_version"] = 6
+                        if same:
+                            config[key] = new_default
+            config["config_version"] = 7
             old_label = {
                 1: "0.1",
                 2: "0.2",
                 3: "0.3",
                 4: "0.4",
                 5: "0.5",
+                6: "0.6",
             }.get(loaded_version, str(loaded_version))
             backup_path = path.with_name(f"config.v{old_label}-backup.json")
-            temporary_path = path.with_name(path.name + ".v6.tmp")
+            temporary_path = path.with_name(path.name + ".v7.tmp")
             migration_saved = False
             try:
                 if not backup_path.exists():
@@ -5061,13 +6019,13 @@ def load_config(path: Path) -> dict[str, Any]:
                 except OSError:
                     pass
                 print(
-                    f"[Config] Could not save the v6 profile ({exc}); "
+                    f"[Config] Could not save the v7 profile ({exc}); "
                     "using it in memory for this run.",
                     flush=True,
                 )
             status = f" and saved {backup_path.name}" if migration_saved else ""
             print(
-                "[Config] Applied the v0.6 low-light articulated-foot profile"
+                "[Config] Applied the v0.7 hard-locked heel-pivot profile"
                 f"{status}.",
                 flush=True,
             )
@@ -5098,10 +6056,32 @@ def load_config(path: Path) -> dict[str, Any]:
     patch_grid = int(config["optical_flow_patch_grid_size"])
     if patch_grid not in {1, 3, 5}:
         raise ValueError("optical_flow_patch_grid_size must be 1, 3, or 5")
+    manual_grid = int(config["manual_anchor_patch_grid_size"])
+    if manual_grid not in {3, 5, 7}:
+        raise ValueError("manual_anchor_patch_grid_size must be 3, 5, or 7")
+    manual_votes = int(config["manual_anchor_min_patch_votes"])
+    if not 3 <= manual_votes <= manual_grid * manual_grid:
+        raise ValueError(
+            "manual_anchor_min_patch_votes must be between 3 and the manual grid area"
+        )
+    manual_template_size = int(config["manual_anchor_template_size_pixels"])
+    if manual_template_size < 9 or manual_template_size > 41 or manual_template_size % 2 == 0:
+        raise ValueError(
+            "manual_anchor_template_size_pixels must be an odd number from 9 to 41"
+        )
+    manual_template_search = int(config["manual_anchor_template_search_pixels"])
+    if not 2 <= manual_template_search <= 24:
+        raise ValueError("manual_anchor_template_search_pixels must be between 2 and 24")
     require_range("pedal_min_feature_coverage", 0.05, 1.0)
     require_range("pedal_direction_tolerance_degrees", 0.0, 89.0)
     require_range("pedal_magnitude_blend", 0.0, 1.0)
     require_range("foot_core_min_confidence", 0.05, 1.0)
+    require_range("manual_anchor_min_separation_pixels", 2.0, 40.0)
+    require_range("manual_anchor_template_min_score", 0.10, 0.95)
+    require_range("manual_anchor_template_rotation_degrees", 0.0, 35.0)
+    require_range("manual_triangle_max_edge_change_ratio", 0.03, 0.80)
+    require_range("calibration_min_heel_tilt_degrees", 0.1, 30.0)
+    require_range("heel_extension_weight", 0.0, 0.45)
     require_range("throttle_response_boost", 0.0, 2.0)
     require_range("brake_response_boost", 0.0, 2.0)
     return config
@@ -5154,6 +6134,11 @@ def parse_arguments() -> argparse.Namespace:
         action="store_true",
         help="Show a normal opaque diagnostic window instead of a desktop overlay",
     )
+    parser.add_argument(
+        "--anchor-setup",
+        action="store_true",
+        help="Start the clickable six-point heel/ankle/toe hard-lock setup",
+    )
     mode_group = parser.add_mutually_exclusive_group()
     mode_group.add_argument(
         "--pedals-only",
@@ -5189,6 +6174,8 @@ def main() -> int:
             config["control_mode"] = "pedals_only"
         elif args.full_controls:
             config["control_mode"] = "feet_and_hands"
+        config["_anchor_setup_requested"] = bool(args.anchor_setup)
+        config["_windowed_hud"] = bool(args.windowed_hud)
     except Exception as exc:
         show_native_error(f"Could not load configuration:\n\n{exc}")
         return 2
@@ -5205,7 +6192,10 @@ def main() -> int:
 
     stop_event = threading.Event()
     shared = SharedState(show_preview=bool(config["show_camera_preview"]))
-    shared.update(pedals_only=config["control_mode"] == "pedals_only")
+    shared.update(
+        pedals_only=config["control_mode"] == "pedals_only",
+        preview_mirrored=bool(config.get("mirror_preview", True)),
+    )
     overlay = OverlayWindow(
         shared=shared,
         stop_event=stop_event,
